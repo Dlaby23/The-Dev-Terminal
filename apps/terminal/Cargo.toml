@@ -1,0 +1,21 @@
+[package]
+name = "the-dev-terminal"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "the-dev-terminal"
+path = "src/main.rs"
+
+[dependencies]
+the-dev-terminal-core = { path = "../../crates/core" }
+the-dev-terminal-ui-wgpu = { path = "../../crates/ui-wgpu" }
+winit = { workspace = true }
+wgpu = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }

@@ -1,0 +1,19 @@
+[package]
+name = "the-dev-terminal-ui-wgpu"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+the-dev-terminal-core = { path = "../core" }
+wgpu = { workspace = true }
+winit = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+raw-window-handle = { workspace = true }
+
+[lib]
+name = "the_dev_terminal_ui_wgpu"
+path = "src/lib.rs"

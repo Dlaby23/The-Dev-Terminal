@@ -1,0 +1,26 @@
+{
+  "part": "Week 3",
+  "objective": "High-quality text (HarfBuzz shaping, emoji/color fonts), IME composition, keyboard maps, themes.",
+  "tasks": [
+    "Integrate harfbuzz_rs for shaping; ensure ligatures and complex scripts.",
+    "Emoji/color fonts via COLR/CPAL/SBIX fallback; glyph atlas warmup.",
+    "IME composition underline/caret; candidate windows positioning.",
+    "Config system (TOML/JSON) for fonts, size, colors, keymaps.",
+    "Keymaps: Vim/Emacs modes optional layer.",
+    "Theming: light/dark; export/import themes."
+  ],
+  "tests": [
+    "Shaping golden cases (Arabic, Devanagari, ligatures like `ffi`).",
+    "IME composition end-to-end test (simulated events).",
+    "Theme snapshot tests; no regress on contrast ratios."
+  ],
+  "links_additional": [
+    "https://harfbuzz.github.io/harfbuzz-shaping.html",
+    "https://learn.microsoft.com/en-us/typography/opentype/spec/colr"
+  ],
+  "after_completion_git": [
+    "git add .",
+    "git commit -m \"Week 3: shaping, emoji/color fonts, IME, config, keymaps, themes\"",
+    "git push"
+  ]
+}

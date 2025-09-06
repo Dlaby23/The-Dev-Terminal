@@ -1,0 +1,34 @@
+{
+  "part": "Week 1",
+  "objective": "Get a live zsh prompt rendered via wgpu/Metal; input to PTY; minimal VT parsing; smoketest.",
+  "tasks": [
+    "Create Cargo workspace: crates(core, ui-wgpu), apps/terminal.",
+    "Implement EventLoop (winit) + wgpu surface with sRGB format; present every RedrawRequested.",
+    "Add `--smoketest` flag that draws 3 frames and exits 0.",
+    "Spawn `/bin/zsh` via portable-pty; wrap writer in Arc<Mutex<_>>.",
+    "Implement basic keyboard path: ReceivedCharacter + Enter/Backspace/Tab/Esc + arrows.",
+    "Integrate vte::Parser with Perform { print, CR, LF, ED(2), CUP } to a simple Grid.",
+    "Render grid as monospace text via glyphon/cosmic-text (temporary) and draw a solid cursor.",
+    "Resize handling: reconfigure surface + recompute rows/cols + PtySize."
+  ],
+  "tests": [
+    "Unit: feed PTY replay bytes into Grid::advance_bytes → expect prompt substring.",
+    "Smoketest: 3 presents within 5s → exit 0.",
+    "Input test: programmatically write `echo OK && printf \"\\n\"\\r` on spawn → shows `OK`."
+  ],
+  "links_additional": [
+    "https://sotrh.github.io/learn-wgpu/",
+    "https://wgpu.rs/",
+    "https://docs.rs/portable-pty/latest/portable_pty/",
+    "https://docs.rs/winit/latest/winit/"
+  ],
+  "after_completion_git": [
+    "echo \"# The-Dev-Terminal\" >> README.md",
+    "git init",
+    "git add README.md",
+    "git commit -m \"first commit\"",
+    "git branch -M main",
+    "git remote add origin https://github.com/Dlaby23/The-Dev-Terminal.git",
+    "git push -u origin main"
+  ]
+}

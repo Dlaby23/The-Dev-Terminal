@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/ui-wgpu",
+    "apps/terminal",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["The-Dev-Terminal Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Dlaby23/The-Dev-Terminal"
+
+[workspace.dependencies]
+winit = "0.29"
+wgpu = "0.19"
+portable-pty = "0.8"
+vte = "0.13"
+tokio = { version = "1.36", features = ["full"] }
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+raw-window-handle = "0.6"

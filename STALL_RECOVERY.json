@@ -1,0 +1,20 @@
+{
+  "mode": "STALL_RECOVERY",
+  "steps": [
+    "Summarize last 3 attempts and why no visible change.",
+    "Audit logs for: RedrawRequested, frame.present(), PTY read, vte advance.",
+    "Form 2 micro-hypotheses; propose ≤30 LOC experiment for each.",
+    "Run experiment A; if fail, revert and try B; report results.",
+    "Pick the smallest passing step; create a tiny PR (≤150 LOC)."
+  ],
+  "stop_if": [
+    "smoketest fails",
+    "no git diff",
+    "edited >5 files without need"
+  ],
+  "deliver": [
+    "diff summary",
+    "logs showing present() count and PTY activity",
+    "short demo instructions"
+  ]
+}
