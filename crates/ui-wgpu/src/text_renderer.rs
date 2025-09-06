@@ -1,4 +1,4 @@
-use the_dev_terminal_core::Grid;
+use the_dev_terminal_core::grid::Grid;
 use std::sync::{Arc, Mutex};
 use wgpu::{Device, Queue};
 

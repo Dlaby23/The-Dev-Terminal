@@ -1,150 +1,98 @@
-use serde::{Deserialize, Serialize};
+use unicode_width::UnicodeWidthChar;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct CellAttributes {
-    pub fg_color: Option<[u8; 3]>,
-    pub bg_color: Option<[u8; 3]>,
-    pub bold: bool,
-    pub italic: bool,
-    pub underline: bool,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct Cell {
-    pub c: char,
-    pub attrs: CellAttributes,
+#[derive(Clone, Copy, Default)]
+pub struct Cell { 
+    pub ch: char 
 }
 
 pub struct Grid {
-    pub cells: Vec<Vec<Cell>>,
-    pub cursor_row: usize,
-    pub cursor_col: usize,
-    pub rows: usize,
     pub cols: usize,
-    scrollback: Vec<Vec<Cell>>,
-    max_scrollback_lines: usize,
+    pub rows: usize,
+    pub cells: Vec<Cell>,
+    pub x: usize,
+    pub y: usize,
 }
 
 impl Grid {
-    pub fn new(rows: usize, cols: usize) -> Self {
-        let cells = vec![vec![Cell::default(); cols]; rows];
-        Self {
-            cells,
-            cursor_row: 0,
-            cursor_col: 0,
-            rows,
-            cols,
-            scrollback: Vec::new(),
-            max_scrollback_lines: 10000,
+    pub fn new(cols: usize, rows: usize) -> Self {
+        Self { 
+            cols, 
+            rows, 
+            cells: vec![Cell::default(); cols * rows], 
+            x: 0, 
+            y: 0 
         }
     }
-
-    pub fn resize(&mut self, new_rows: usize, new_cols: usize) {
-        let mut new_cells = vec![vec![Cell::default(); new_cols]; new_rows];
-        
-        for (row_idx, row) in self.cells.iter().take(new_rows.min(self.rows)).enumerate() {
-            for (col_idx, cell) in row.iter().take(new_cols.min(self.cols)).enumerate() {
-                new_cells[row_idx][col_idx] = cell.clone();
+    
+    pub fn resize(&mut self, cols: usize, rows: usize) {
+        self.cols = cols; 
+        self.rows = rows;
+        self.cells.resize(cols * rows, Cell::default());
+        self.clear_all();
+        self.x = 0; 
+        self.y = 0;
+    }
+    
+    fn idx(&self, x: usize, y: usize) -> usize { 
+        y * self.cols + x 
+    }
+    
+    pub fn clear_all(&mut self) { 
+        for c in &mut self.cells { 
+            *c = Cell::default(); 
+        } 
+    }
+    
+    pub fn clear_eol(&mut self) {
+        let start = self.idx(self.x, self.y);
+        let end = self.idx(self.cols - 1, self.y) + 1;
+        for i in start..end { 
+            self.cells[i] = Cell::default(); 
+        }
+    }
+    
+    pub fn put(&mut self, ch: char) {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(1).max(1).min(2);
+        if self.x >= self.cols { 
+            self.wrap(); 
+        }
+        let idx = self.y * self.cols + self.x;
+        self.cells[idx].ch = ch;
+        self.x = (self.x + w).min(self.cols.saturating_sub(1));
+    }
+    
+    pub fn wrap(&mut self) { 
+        self.cr(); 
+        self.lf(); 
+    }
+    
+    pub fn cr(&mut self) { 
+        self.x = 0; 
+    }
+    
+    pub fn lf(&mut self) {
+        if self.y + 1 < self.rows { 
+            self.y += 1; 
+        } else {
+            // scroll up by 1
+            let cols = self.cols;
+            self.cells.rotate_left(cols);
+            let start = (self.rows - 1) * self.cols;
+            for i in start..self.cells.len() { 
+                self.cells[i] = Cell::default(); 
             }
         }
-        
-        self.cells = new_cells;
-        self.rows = new_rows;
-        self.cols = new_cols;
-        
-        if self.cursor_row >= new_rows {
-            self.cursor_row = new_rows.saturating_sub(1);
-        }
-        if self.cursor_col >= new_cols {
-            self.cursor_col = new_cols.saturating_sub(1);
-        }
     }
-
-    pub fn print_char(&mut self, c: char) {
-        if self.cursor_col < self.cols && self.cursor_row < self.rows {
-            self.cells[self.cursor_row][self.cursor_col].c = c;
-            self.cursor_col += 1;
-            
-            if self.cursor_col >= self.cols {
-                self.cursor_col = 0;
-                self.line_feed();
+    
+    pub fn to_string_lines(&self) -> String {
+        let mut s = String::with_capacity(self.rows * (self.cols + 1));
+        for r in 0..self.rows {
+            for c in 0..self.cols { 
+                let ch = self.cells[self.idx(c, r)].ch;
+                s.push(if ch == '\0' { ' ' } else { ch });
             }
+            s.push('\n');
         }
-    }
-
-    pub fn carriage_return(&mut self) {
-        self.cursor_col = 0;
-    }
-
-    pub fn line_feed(&mut self) {
-        self.cursor_row += 1;
-        if self.cursor_row >= self.rows {
-            self.scroll_up();
-            self.cursor_row = self.rows - 1;
-        }
-    }
-
-    pub fn erase_display(&mut self, mode: u16) {
-        match mode {
-            0 => {
-                for col in self.cursor_col..self.cols {
-                    self.cells[self.cursor_row][col] = Cell::default();
-                }
-                for row in (self.cursor_row + 1)..self.rows {
-                    for col in 0..self.cols {
-                        self.cells[row][col] = Cell::default();
-                    }
-                }
-            }
-            1 => {
-                for col in 0..=self.cursor_col {
-                    self.cells[self.cursor_row][col] = Cell::default();
-                }
-                for row in 0..self.cursor_row {
-                    for col in 0..self.cols {
-                        self.cells[row][col] = Cell::default();
-                    }
-                }
-            }
-            2 => {
-                for row in 0..self.rows {
-                    for col in 0..self.cols {
-                        self.cells[row][col] = Cell::default();
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    pub fn cursor_position(&mut self, row: usize, col: usize) {
-        self.cursor_row = row.saturating_sub(1).min(self.rows - 1);
-        self.cursor_col = col.saturating_sub(1).min(self.cols - 1);
-    }
-
-    fn scroll_up(&mut self) {
-        if !self.cells.is_empty() {
-            let line = self.cells.remove(0);
-            if self.scrollback.len() >= self.max_scrollback_lines {
-                self.scrollback.remove(0);
-            }
-            self.scrollback.push(line);
-            self.cells.push(vec![Cell::default(); self.cols]);
-        }
-    }
-
-    pub fn get_visible_text(&self) -> String {
-        let mut result = String::new();
-        for row in &self.cells {
-            for cell in row {
-                if cell.c == '\0' || cell.c == ' ' {
-                    result.push(' ');
-                } else {
-                    result.push(cell.c);
-                }
-            }
-            result.push('\n');
-        }
-        result
+        s
     }
 }

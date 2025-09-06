@@ -1,98 +1,106 @@
+use vte::{Params, Perform};
 use crate::grid::Grid;
-use std::sync::{Arc, Mutex};
-use vte::{Params, Parser, Perform};
 
-pub struct VtParser {
-    parser: Parser,
-    grid: Arc<Mutex<Grid>>,
+pub struct Performer<'a> { 
+    pub g: &'a mut Grid 
 }
 
-impl VtParser {
-    pub fn new(grid: Arc<Mutex<Grid>>) -> Self {
-        Self {
-            parser: Parser::new(),
-            grid,
-        }
+impl<'a> Perform for Performer<'a> {
+    // Printable glyphs
+    fn print(&mut self, c: char) { 
+        self.g.put(c); 
     }
 
-    pub fn advance(&mut self, bytes: &[u8]) {
-        let mut performer = VtPerformer {
-            grid: self.grid.clone(),
-        };
-        
-        for byte in bytes {
-            self.parser.advance(&mut performer, *byte);
-        }
-    }
-}
-
-struct VtPerformer {
-    grid: Arc<Mutex<Grid>>,
-}
-
-impl Perform for VtPerformer {
-    fn print(&mut self, c: char) {
-        let mut grid = self.grid.lock().unwrap();
-        grid.print_char(c);
-    }
-
+    // C0 controls like \n \r \t \x08 (backspace)
     fn execute(&mut self, byte: u8) {
-        let mut grid = self.grid.lock().unwrap();
         match byte {
-            b'\r' => grid.carriage_return(),
-            b'\n' => grid.line_feed(),
+            b'\n' => self.g.lf(),
+            b'\r' => self.g.cr(),
             b'\t' => {
-                let tab_stop = ((grid.cursor_col / 8) + 1) * 8;
-                let tab_stop = tab_stop.min(grid.cols - 1);
-                for _ in grid.cursor_col..tab_stop {
-                    grid.print_char(' ');
+                // Tab: move to next tab stop (every 8 columns)
+                let tab_stop = ((self.g.x / 8) + 1) * 8;
+                let tab_stop = tab_stop.min(self.g.cols - 1);
+                while self.g.x < tab_stop {
+                    self.g.put(' ');
                 }
             }
-            b'\x08' => {
-                if grid.cursor_col > 0 {
-                    grid.cursor_col -= 1;
-                }
+            0x08 => { 
+                // Backspace
+                if self.g.x > 0 { 
+                    self.g.x -= 1; 
+                } 
             }
             _ => {}
         }
     }
 
-    fn csi_dispatch(&mut self, params: &Params, _intermediates: &[u8], _ignore: bool, action: char) {
-        let mut grid = self.grid.lock().unwrap();
-        match action {
+    // CSI sequences (ESC [ ... )
+    fn csi_dispatch(&mut self, params: &Params, _inter: &[u8], _ignore: bool, c: char) {
+        match c {
+            // ED – erase in display (0 or 2)
             'J' => {
-                let mode = params.iter().next().map(|p| p[0]).unwrap_or(0);
-                grid.erase_display(mode);
+                let n = params.iter().next().and_then(|p| p.first()).copied().unwrap_or(0);
+                if n == 2 { 
+                    self.g.clear_all(); 
+                }
+                // (0 and 1 can be added later)
             }
+            // EL – erase in line (0)
+            'K' => { 
+                self.g.clear_eol(); 
+            }
+            // CUP – cursor position: 1-based row;col
             'H' | 'f' => {
-                let mut params_iter = params.iter();
-                let row = params_iter.next().and_then(|p| p.get(0)).map(|&v| v as usize).unwrap_or(1);
-                let col = params_iter.next().and_then(|p| p.get(0)).map(|&v| v as usize).unwrap_or(1);
-                grid.cursor_position(row, col);
+                let mut it = params.iter();
+                let row = it.next().and_then(|p| p.first()).copied().unwrap_or(1) as usize;
+                let col = it.next().and_then(|p| p.first()).copied().unwrap_or(1) as usize;
+                self.g.y = row.saturating_sub(1).min(self.g.rows.saturating_sub(1));
+                self.g.x = col.saturating_sub(1).min(self.g.cols.saturating_sub(1));
             }
+            // Cursor movement
             'A' => {
-                let n = params.iter().next().and_then(|p| p.get(0)).map(|&v| v as usize).unwrap_or(1);
-                grid.cursor_row = grid.cursor_row.saturating_sub(n);
+                // Cursor up
+                let n = params.iter().next().and_then(|p| p.first()).copied().unwrap_or(1) as usize;
+                self.g.y = self.g.y.saturating_sub(n);
             }
             'B' => {
-                let n = params.iter().next().and_then(|p| p.get(0)).map(|&v| v as usize).unwrap_or(1);
-                grid.cursor_row = (grid.cursor_row + n).min(grid.rows - 1);
+                // Cursor down
+                let n = params.iter().next().and_then(|p| p.first()).copied().unwrap_or(1) as usize;
+                self.g.y = (self.g.y + n).min(self.g.rows - 1);
             }
             'C' => {
-                let n = params.iter().next().and_then(|p| p.get(0)).map(|&v| v as usize).unwrap_or(1);
-                grid.cursor_col = (grid.cursor_col + n).min(grid.cols - 1);
+                // Cursor forward
+                let n = params.iter().next().and_then(|p| p.first()).copied().unwrap_or(1) as usize;
+                self.g.x = (self.g.x + n).min(self.g.cols - 1);
             }
             'D' => {
-                let n = params.iter().next().and_then(|p| p.get(0)).map(|&v| v as usize).unwrap_or(1);
-                grid.cursor_col = grid.cursor_col.saturating_sub(n);
+                // Cursor backward
+                let n = params.iter().next().and_then(|p| p.first()).copied().unwrap_or(1) as usize;
+                self.g.x = self.g.x.saturating_sub(n);
             }
+            // SGR – ignore colors/styles for now
+            'm' => {}
             _ => {}
         }
     }
 
+    // ESC single-char sequences; ignore for now
+    fn esc_dispatch(&mut self, _inter: &[u8], _ignore: bool, _byte: u8) {}
+    
+    // OSC (ESC ] ... BEL) – vte will swallow; ignore payload
+    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
+    
+    // Hooks for device control strings
     fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
-    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
-    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {}
+}
+
+pub fn advance_bytes(g: &mut Grid, bytes: &[u8]) {
+    static PARSER: std::sync::OnceLock<std::sync::Mutex<vte::Parser>> = std::sync::OnceLock::new();
+    let mut parser = PARSER.get_or_init(|| std::sync::Mutex::new(vte::Parser::new())).lock().unwrap();
+    let mut p = Performer { g };
+    for &b in bytes { 
+        parser.advance(&mut p, b); 
+    }
 }

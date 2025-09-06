@@ -1,7 +1,12 @@
 use anyhow::Result;
-use wgpu::{Instance, Surface, Device, Queue, SurfaceConfiguration, TextureFormat};
+use wgpu::{Instance, Surface, Device, Queue, SurfaceConfiguration};
 use winit::window::Window;
 use std::sync::Arc;
+use cosmic_text::{FontSystem, SwashCache, Buffer as TextBuffer, Metrics, Attrs, Shaping};
+use glyphon::{
+    TextRenderer as GlyphonRenderer, TextAtlas, TextArea, TextBounds,
+    Resolution
+};
 
 pub struct Renderer {
     pub device: Device,
@@ -9,6 +14,13 @@ pub struct Renderer {
     pub surface: Surface<'static>,
     pub config: SurfaceConfiguration,
     window: Arc<Window>,
+    // Text rendering
+    font_system: FontSystem,
+    swash_cache: SwashCache,
+    text_renderer: GlyphonRenderer,
+    text_atlas: TextAtlas,
+    text_buffer: TextBuffer,
+    pending_text: String,
 }
 
 impl Renderer {
@@ -56,11 +68,27 @@ impl Renderer {
             height: size.height,
             present_mode: wgpu::PresentMode::AutoVsync,
             alpha_mode: surface_caps.alpha_modes[0],
-            view_formats: vec![],
+            view_formats: vec![surface_format],
             desired_maximum_frame_latency: 2,
         };
         
         surface.configure(&device, &config);
+        
+        // Initialize text rendering
+        let mut font_system = FontSystem::new();
+        let swash_cache = SwashCache::new();
+        let mut text_atlas = TextAtlas::new(&device, &queue, surface_format);
+        let text_renderer = GlyphonRenderer::new(
+            &mut text_atlas,
+            &device,
+            wgpu::MultisampleState::default(),
+            None,
+        );
+        
+        let mut text_buffer = TextBuffer::new(&mut font_system, Metrics::new(14.0, 18.0));
+        text_buffer.set_size(&mut font_system, size.width as f32, size.height as f32);
+        
+        let pending_text = "Hello from The Dev Terminal\n(type will show once PTY is wired)".to_string();
         
         Ok(Self {
             device,
@@ -68,6 +96,12 @@ impl Renderer {
             surface,
             config,
             window,
+            font_system,
+            swash_cache,
+            text_renderer,
+            text_atlas,
+            text_buffer,
+            pending_text,
         })
     }
     
@@ -76,7 +110,18 @@ impl Renderer {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
+            
+            // Update text buffer size
+            self.text_buffer.set_size(
+                &mut self.font_system,
+                new_size.width as f32,
+                new_size.height as f32
+            );
         }
+    }
+    
+    pub fn set_text(&mut self, s: impl Into<String>) {
+        self.pending_text = s.into();
     }
     
     pub fn render_frame(&mut self) -> Result<()> {
@@ -87,17 +132,18 @@ impl Renderer {
             label: Some("Render Encoder"),
         });
         
+        // Clear to dark gray
         {
             let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
+                label: Some("Clear Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
+                            r: 0.06,
+                            g: 0.06,
+                            b: 0.07,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -107,6 +153,60 @@ impl Renderer {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
+        }
+        
+        // Update and render text
+        self.text_buffer.set_text(
+            &mut self.font_system,
+            &self.pending_text,
+            Attrs::new().family(cosmic_text::Family::Monospace),
+            Shaping::Advanced,
+        );
+        
+        let text_areas = vec![TextArea {
+            buffer: &self.text_buffer,
+            left: 12.0,
+            top: 12.0,
+            scale: 1.0,
+            bounds: TextBounds {
+                left: 0,
+                top: 0,
+                right: self.config.width as i32,
+                bottom: self.config.height as i32,
+            },
+            default_color: glyphon::Color::rgb(255, 255, 255),
+        }];
+        
+        self.text_renderer.prepare(
+            &self.device,
+            &self.queue,
+            &mut self.font_system,
+            &mut self.text_atlas,
+            Resolution {
+                width: self.config.width,
+                height: self.config.height,
+            },
+            text_areas,
+            &mut self.swash_cache,
+        )?;
+        
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Text Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            
+            self.text_renderer.render(&self.text_atlas, &mut render_pass)?;
         }
         
         self.queue.submit(std::iter::once(encoder.finish()));

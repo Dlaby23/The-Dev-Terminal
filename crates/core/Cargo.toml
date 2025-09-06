@@ -13,6 +13,7 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+unicode-width = "0.1"
 
 [lib]
 name = "the_dev_terminal_core"

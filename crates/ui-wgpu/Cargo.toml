@@ -13,6 +13,8 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 raw-window-handle = { workspace = true }
+glyphon = "0.5"
+cosmic-text = "0.10"
 
 [lib]
 name = "the_dev_terminal_ui_wgpu"
