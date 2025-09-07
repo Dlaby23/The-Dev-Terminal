@@ -50,3 +50,12 @@ flamegraph.svg
 build/
 dist/
 out/
+
+# Project planning and sensitive files
+*.json
+.env
+.env.*
+secrets/
+private/
+planning/
+docs/private/
