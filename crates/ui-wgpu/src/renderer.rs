@@ -1,5 +1,6 @@
 use anyhow::Result;
-use wgpu::{Instance, Surface, Device, Queue, SurfaceConfiguration};
+use wgpu::*;
+use wgpu::util::DeviceExt;
 use winit::window::Window;
 use std::sync::Arc;
 use cosmic_text::{FontSystem, SwashCache, Buffer as TextBuffer, Metrics, Attrs, Shaping};
@@ -9,10 +10,16 @@ use glyphon::{
 };
 
 #[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct QuadVertex {
-    position: [f32; 2],
-    color: [f32; 4],
+    pos: [f32; 2],   // pixel coords
+    color: [f32; 4], // rgba
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ScreenUbo { 
+    size: [f32; 2] 
 }
 
 pub struct Renderer {
@@ -26,16 +33,19 @@ pub struct Renderer {
     text_renderer: GlyphonRenderer,
     text_atlas: TextAtlas,
     text_buffer: TextBuffer,
-    text_buffer_selected: TextBuffer,  // Separate buffer for selected text
     pending_text: String,
     font_size: f32,
     pub cell_width: f32,
     pub cell_height: f32,
     // Selection (for visual highlighting)
     pub selection: Option<((usize, usize), (usize, usize))>,
-    // Quad rendering for selection background
-    quad_pipeline: wgpu::RenderPipeline,
-    quad_vertex_buffer: wgpu::Buffer,
+    // Selection pipeline state
+    sel_pipeline: RenderPipeline,
+    sel_bindgroup: BindGroup,
+    sel_bind_layout: BindGroupLayout,
+    sel_screen_ubo: Buffer,
+    sel_vbuf: Buffer,
+    sel_vertices: Vec<QuadVertex>,
 }
 
 impl Renderer {
@@ -107,74 +117,93 @@ impl Renderer {
         let mut text_buffer = TextBuffer::new(&mut font_system, Metrics::new(font_size, cell_height));
         text_buffer.set_size(&mut font_system, size.width as f32, size.height as f32);
         
-        let mut text_buffer_selected = TextBuffer::new(&mut font_system, Metrics::new(font_size, cell_height));
-        text_buffer_selected.set_size(&mut font_system, size.width as f32, size.height as f32);
-        
         let pending_text = "Hello from The Dev Terminal\n(type will show once PTY is wired)".to_string();
         
-        // Create quad pipeline for selection background
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Quad Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("quad.wgsl").into()),
+        // --- selection pipeline setup ---
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("selection.wgsl"),
+            source: ShaderSource::Wgsl(include_str!("shaders/selection.wgsl").into()),
         });
-        
-        let quad_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Quad Pipeline Layout"),
-            bind_group_layouts: &[],
+
+        // uniform: screen size
+        let screen_init = ScreenUbo { size: [config.width as f32, config.height as f32] };
+
+        let sel_screen_ubo = device.create_buffer_init(&util::BufferInitDescriptor {
+            label: Some("sel.screen.ubo"),
+            contents: bytemuck::bytes_of(&screen_init),
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        });
+
+        let sel_bind_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("sel.bindlayout"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let sel_bindgroup = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("sel.bindgroup"),
+            layout: &sel_bind_layout,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: sel_screen_ubo.as_entire_binding(),
+            }],
+        });
+
+        // vertex buffer layout
+        let vbuf_layout = VertexBufferLayout {
+            array_stride: std::mem::size_of::<QuadVertex>() as BufferAddress,
+            step_mode: VertexStepMode::Vertex,
+            attributes: &[
+                // location 0: pos (vec2<f32>)
+                VertexAttribute { offset: 0, shader_location: 0, format: VertexFormat::Float32x2 },
+                // location 1: color (vec4<f32>)
+                VertexAttribute { offset: 8, shader_location: 1, format: VertexFormat::Float32x4 },
+            ],
+        };
+
+        // pipeline
+        let sel_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("sel.pipeline.layout"),
+            bind_group_layouts: &[&sel_bind_layout],
             push_constant_ranges: &[],
         });
-        
-        let quad_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Quad Pipeline"),
-            layout: Some(&quad_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs_main",
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<QuadVertex>() as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        wgpu::VertexAttribute {
-                            offset: 0,
-                            shader_location: 0,
-                            format: wgpu::VertexFormat::Float32x2,
-                        },
-                        wgpu::VertexAttribute {
-                            offset: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
-                            shader_location: 1,
-                            format: wgpu::VertexFormat::Float32x4,
-                        },
-                    ],
-                }],
+
+        let sel_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("sel.pipeline"),
+            layout: Some(&sel_pipeline_layout),
+            vertex: VertexState { 
+                module: &shader, 
+                entry_point: "vs_main", 
+                buffers: &[vbuf_layout],
             },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
+            fragment: Some(FragmentState {
+                module: &shader, 
                 entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
+                targets: &[Some(ColorTargetState {
+                    format: config.format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
                 })],
             }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
+            primitive: PrimitiveState::default(),
             depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
+            multisample: MultisampleState::default(),
             multiview: None,
         });
-        
-        // Create vertex buffer for quads (will be updated each frame)
-        let quad_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Quad Vertex Buffer"),
-            size: 1024 * std::mem::size_of::<QuadVertex>() as u64, // Space for many quads
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+
+        // dynamic vertex buffer (we'll rebuild each frame as needed)
+        let sel_vbuf = device.create_buffer(&BufferDescriptor {
+            label: Some("sel.vbuf"),
+            size: (std::mem::size_of::<QuadVertex>() * 6 * 1024) as BufferAddress, // up to 1024 rects
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         
@@ -188,14 +217,17 @@ impl Renderer {
             text_renderer,
             text_atlas,
             text_buffer,
-            text_buffer_selected,
             pending_text,
             font_size,
             cell_width,
             cell_height,
             selection: None,
-            quad_pipeline,
-            quad_vertex_buffer,
+            sel_pipeline,
+            sel_bind_layout,
+            sel_bindgroup,
+            sel_screen_ubo,
+            sel_vbuf,
+            sel_vertices: Vec::with_capacity(6 * 64),
         })
     }
     
@@ -205,17 +237,16 @@ impl Renderer {
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
             
-            // Update text buffer sizes
+            // Update text buffer size
             self.text_buffer.set_size(
                 &mut self.font_system,
                 new_size.width as f32,
                 new_size.height as f32
             );
-            self.text_buffer_selected.set_size(
-                &mut self.font_system,
-                new_size.width as f32,
-                new_size.height as f32
-            );
+            
+            // Update screen UBO for selection shader
+            let screen_data = [new_size.width as f32, new_size.height as f32];
+            self.queue.write_buffer(&self.sel_screen_ubo, 0, bytemuck::cast_slice(&screen_data));
         }
     }
     
@@ -241,10 +272,6 @@ impl Renderer {
             &mut self.font_system,
             Metrics::new(self.font_size, self.cell_height)
         );
-        self.text_buffer_selected.set_metrics(
-            &mut self.font_system,
-            Metrics::new(self.font_size, self.cell_height)
-        );
         
         // Recompute buffer size to the window
         self.text_buffer.set_size(
@@ -252,36 +279,71 @@ impl Renderer {
             self.config.width as f32,
             self.config.height as f32
         );
-        self.text_buffer_selected.set_size(
-            &mut self.font_system,
-            self.config.width as f32,
-            self.config.height as f32
-        );
+    }
+    
+    #[inline]
+    pub fn push_rect(&mut self, x: f32, y: f32, w: f32, h: f32, rgba: [f32;4]) {
+        // two triangles (6 vertices) in pixel coordinates
+        let (x0, y0) = (x,     y);
+        let (x1, y1) = (x + w, y + h);
+
+        let v0 = QuadVertex { pos: [x0, y0], color: rgba };
+        let v1 = QuadVertex { pos: [x1, y0], color: rgba };
+        let v2 = QuadVertex { pos: [x0, y1], color: rgba };
+        let v3 = QuadVertex { pos: [x1, y1], color: rgba };
+
+        // tri 1: v0, v1, v2; tri 2: v2, v1, v3
+        self.sel_vertices.extend_from_slice(&[v0, v1, v2, v2, v1, v3]);
+    }
+
+    fn flush_rects<'a>(&'a mut self, encoder: &mut CommandEncoder, view: &'a TextureView) {
+        if self.sel_vertices.is_empty() { return; }
+        
+        // upload
+        self.queue.write_buffer(&self.sel_vbuf, 0, bytemuck::cast_slice(&self.sel_vertices));
+        
+        // draw
+        let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("selection.pass"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view, 
+                resolve_target: None,
+                ops: Operations { 
+                    load: LoadOp::Load, 
+                    store: StoreOp::Store 
+                },
+            })],
+            depth_stencil_attachment: None,
+            occlusion_query_set: None,
+            timestamp_writes: None,
+        });
+        
+        pass.set_pipeline(&self.sel_pipeline);
+        pass.set_bind_group(0, &self.sel_bindgroup, &[]);
+        pass.set_vertex_buffer(0, self.sel_vbuf.slice(..));
+        pass.draw(0..(self.sel_vertices.len() as u32), 0..1);
+        drop(pass);
+        
+        self.sel_vertices.clear();
     }
     
     pub fn render_frame(&mut self) -> Result<()> {
         let output = self.surface.get_current_texture()?;
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Render Encoder"),
+        let view = output.texture.create_view(&TextureViewDescriptor::default());
+        let mut encoder = self.device.create_command_encoder(&CommandEncoderDescriptor { 
+            label: Some("encoder") 
         });
-        
-        // Clear to dark gray
+
+        // 1) clear background
         {
-            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Clear Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+            let _rp = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("clear"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view, 
                     resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.06,
-                            g: 0.06,
-                            b: 0.07,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
+                    ops: Operations { 
+                        load: LoadOp::Clear(Color { r: 0.06, g: 0.06, b: 0.07, a: 1.0 }), 
+                        store: StoreOp::Store 
                     },
                 })],
                 depth_stencil_attachment: None,
@@ -289,162 +351,53 @@ impl Renderer {
                 timestamp_writes: None,
             });
         }
-        
-        // Render selection background if there's a selection
+
+        // 2) push selection rects
         if let Some(((x0, y0), (x1, y1))) = self.selection {
-            let min_x = x0.min(x1);
-            let max_x = x0.max(x1);
-            let min_y = y0.min(y1);
-            let max_y = y0.max(y1);
+            let minx = x0.min(x1);
+            let maxx = x0.max(x1);
+            let miny = y0.min(y1);
+            let maxy = y0.max(y1);
             
-            // Build quads for selected cells
-            let mut vertices = Vec::new();
-            
-            for row in min_y..=max_y {
-                let start_col = if row == min_y { min_x } else { 0 };
-                let end_col = if row == max_y { max_x } else { self.config.width as usize / self.cell_width as usize };
+            for row in miny..=maxy {
+                let start_col = if row == miny { minx } else { 0 };
+                let end_col = if row == maxy { maxx } else { 
+                    (self.config.width as f32 / self.cell_width) as usize - 1 
+                };
                 
-                // Create a quad for this row's selection
-                let left = 12.0 + (start_col as f32 * self.cell_width);
-                let right = 12.0 + ((end_col + 1) as f32 * self.cell_width);
-                let top = 12.0 + (row as f32 * self.cell_height);
-                let bottom = top + self.cell_height;
-                
-                // Convert to NDC coordinates (-1 to 1)
-                let left_ndc = (left / self.config.width as f32) * 2.0 - 1.0;
-                let right_ndc = (right / self.config.width as f32) * 2.0 - 1.0;
-                let top_ndc = 1.0 - (top / self.config.height as f32) * 2.0;
-                let bottom_ndc = 1.0 - (bottom / self.config.height as f32) * 2.0;
-                
-                // Semi-transparent blue background
-                let color = [0.2, 0.4, 0.8, 0.3]; // Blue with 30% opacity
-                
-                // Two triangles for a quad
-                vertices.extend_from_slice(&[
-                    QuadVertex { position: [left_ndc, top_ndc], color },
-                    QuadVertex { position: [right_ndc, top_ndc], color },
-                    QuadVertex { position: [left_ndc, bottom_ndc], color },
-                    
-                    QuadVertex { position: [right_ndc, top_ndc], color },
-                    QuadVertex { position: [right_ndc, bottom_ndc], color },
-                    QuadVertex { position: [left_ndc, bottom_ndc], color },
-                ]);
-            }
-            
-            if !vertices.is_empty() {
-                // Update vertex buffer
-                self.queue.write_buffer(
-                    &self.quad_vertex_buffer,
-                    0,
-                    bytemuck::cast_slice(&vertices),
-                );
-                
-                // Render selection background
-                {
-                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("Selection Background Pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        occlusion_query_set: None,
-                        timestamp_writes: None,
-                    });
-                    
-                    render_pass.set_pipeline(&self.quad_pipeline);
-                    render_pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
-                    render_pass.draw(0..vertices.len() as u32, 0..1);
+                for col in start_col..=end_col {
+                    let x = 12.0 + col as f32 * self.cell_width;
+                    let y = 12.0 + row as f32 * self.cell_height;
+                    // Semi-transparent blue selection background
+                    self.push_rect(x, y, self.cell_width, self.cell_height, [0.2, 0.4, 0.8, 0.3]);
                 }
             }
         }
         
-        // Prepare text - split into selected and non-selected
-        let lines: Vec<&str> = self.pending_text.lines().collect();
-        let mut normal_text = String::new();
-        let mut selected_text = String::new();
-        
-        if let Some(((x0, y0), (x1, y1))) = self.selection {
-            let min_x = x0.min(x1);
-            let max_x = x0.max(x1);
-            let min_y = y0.min(y1);
-            let max_y = y0.max(y1);
-            
-            for (row, line) in lines.iter().enumerate() {
-                let chars: Vec<char> = line.chars().collect();
-                for (col, ch) in chars.iter().enumerate() {
-                    let is_selected = row >= min_y && row <= max_y &&
-                        ((row == min_y && col >= min_x) || row > min_y) &&
-                        ((row == max_y && col <= max_x) || row < max_y);
-                    
-                    if is_selected {
-                        selected_text.push(*ch);
-                        normal_text.push(' '); // Space placeholder
-                    } else {
-                        normal_text.push(*ch);
-                        selected_text.push(' '); // Space placeholder
-                    }
-                }
-                normal_text.push('\n');
-                selected_text.push('\n');
-            }
-        } else {
-            normal_text = self.pending_text.clone();
-            selected_text = self.pending_text.chars().map(|c| if c == '\n' { '\n' } else { ' ' }).collect();
-        }
-        
-        // Update text buffers
+        // Flush selection rectangles
+        self.flush_rects(&mut encoder, &view);
+
+        // 3) draw text on top
         self.text_buffer.set_text(
             &mut self.font_system,
-            &normal_text,
+            &self.pending_text,
             Attrs::new().family(cosmic_text::Family::Monospace),
             Shaping::Advanced,
         );
         
-        self.text_buffer_selected.set_text(
-            &mut self.font_system,
-            &selected_text,
-            Attrs::new().family(cosmic_text::Family::Monospace),
-            Shaping::Advanced,
-        );
-        
-        // Prepare text areas
-        let mut text_areas = vec![
-            TextArea {
-                buffer: &self.text_buffer,
-                left: 12.0,
-                top: 12.0,
-                scale: 1.0,
-                bounds: TextBounds {
-                    left: 0,
-                    top: 0,
-                    right: self.config.width as i32,
-                    bottom: self.config.height as i32,
-                },
-                default_color: glyphon::Color::rgb(255, 255, 255), // White for normal text
-            }
-        ];
-        
-        // Add selected text overlay if there's a selection
-        if self.selection.is_some() {
-            text_areas.push(TextArea {
-                buffer: &self.text_buffer_selected,
-                left: 12.0,
-                top: 12.0,
-                scale: 1.0,
-                bounds: TextBounds {
-                    left: 0,
-                    top: 0,
-                    right: self.config.width as i32,
-                    bottom: self.config.height as i32,
-                },
-                default_color: glyphon::Color::rgb(100, 150, 255), // Light blue for selected text
-            });
-        }
+        let text_areas = vec![TextArea {
+            buffer: &self.text_buffer,
+            left: 12.0,
+            top: 12.0,
+            scale: 1.0,
+            bounds: TextBounds {
+                left: 0,
+                top: 0,
+                right: self.config.width as i32,
+                bottom: self.config.height as i32,
+            },
+            default_color: glyphon::Color::rgb(255, 255, 255),
+        }];
         
         self.text_renderer.prepare(
             &self.device,
@@ -460,14 +413,14 @@ impl Renderer {
         )?;
         
         {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("Text Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
+                    ops: Operations {
+                        load: LoadOp::Load,
+                        store: StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: None,
@@ -477,8 +430,9 @@ impl Renderer {
             
             self.text_renderer.render(&self.text_atlas, &mut render_pass)?;
         }
-        
-        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // 4) submit
+        self.queue.submit([encoder.finish()]);
         output.present();
         
         Ok(())
