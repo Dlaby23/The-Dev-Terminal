@@ -10,7 +10,7 @@ use tracing_subscriber;
 use winit::{
     event::{Event, WindowEvent, ElementState, KeyEvent},
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
-    keyboard::{Key, KeyCode, PhysicalKey},
+    keyboard::{Key, KeyCode, PhysicalKey, ModifiersState},
     window::WindowBuilder,
 };
 
@@ -51,23 +51,14 @@ async fn run(args: Args) -> Result<()> {
     let grid = Arc::new(Mutex::new(Grid::new(80, 25)));
     
     let (pty, pty_rx) = PtyHandle::spawn(25, 80)?;
-    let pty = Arc::new(pty);
     
     let proxy = event_loop.create_proxy();
     
     spawn_pty_reader(pty_rx, proxy.clone());
     
-    // Test command injection to verify typing works
-    if !args.smoketest {
-        let pty_test = pty.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let _ = pty_test.write(b"echo 'Terminal OK' && printf \"\\n\"\r");
-        });
-    }
-    
     let mut frame_count = 0;
     let start_time = Instant::now();
+    let mut modifiers = ModifiersState::empty();
     
     event_loop.set_control_flow(ControlFlow::Wait);
     
@@ -96,14 +87,16 @@ async fn run(args: Args) -> Result<()> {
                     elwt.exit();
                 }
                 
+                WindowEvent::ModifiersChanged(new_mods) => {
+                    modifiers = new_mods.state();
+                }
+                
                 WindowEvent::Resized(physical_size) => {
                     renderer.resize(physical_size);
                     
-                    // Calculate cells based on font metrics (estimated)
-                    const CELL_WIDTH: f32 = 9.0;
-                    const CELL_HEIGHT: f32 = 18.0;
-                    let cols = ((physical_size.width as f32) / CELL_WIDTH).floor().max(1.0) as u16;
-                    let rows = ((physical_size.height as f32) / CELL_HEIGHT).floor().max(1.0) as u16;
+                    // Calculate cells based on actual font metrics
+                    let cols = ((physical_size.width as f32) / renderer.cell_width).floor().max(1.0) as u16;
+                    let rows = ((physical_size.height as f32) / renderer.cell_height).floor().max(1.0) as u16;
                     
                     // Update grid
                     {
@@ -125,8 +118,83 @@ async fn run(args: Args) -> Result<()> {
                     },
                     ..
                 } => {
+                    // Handle zoom shortcuts when Command is held (macOS)
+                    if modifiers.super_key() {
+                        const STEP_PT: f32 = 1.0;
+                        const DEFAULT_PT: f32 = 14.0;
+                        
+                        match physical_key {
+                            // Cmd + (Note: '+' is Shift + '=' so we watch Equal)
+                            PhysicalKey::Code(KeyCode::Equal) => {
+                                let new_size = renderer.font_size() + STEP_PT;
+                                renderer.set_font_size(new_size);
+                                
+                                // Recalculate cols/rows with new font size
+                                let size = window.inner_size();
+                                let cols = ((size.width as f32) / renderer.cell_width).floor().max(1.0) as u16;
+                                let rows = ((size.height as f32) / renderer.cell_height).floor().max(1.0) as u16;
+                                
+                                // Update grid
+                                {
+                                    let mut g = grid.lock().unwrap();
+                                    g.resize(cols as usize, rows as usize);
+                                }
+                                
+                                // Update PTY
+                                let _ = pty.resize(rows, cols);
+                                window.request_redraw();
+                                info!("Zoom in: font size {}", renderer.font_size());
+                            }
+                            // Cmd -
+                            PhysicalKey::Code(KeyCode::Minus) => {
+                                let new_size = renderer.font_size() - STEP_PT;
+                                renderer.set_font_size(new_size);
+                                
+                                // Recalculate cols/rows with new font size
+                                let size = window.inner_size();
+                                let cols = ((size.width as f32) / renderer.cell_width).floor().max(1.0) as u16;
+                                let rows = ((size.height as f32) / renderer.cell_height).floor().max(1.0) as u16;
+                                
+                                // Update grid
+                                {
+                                    let mut g = grid.lock().unwrap();
+                                    g.resize(cols as usize, rows as usize);
+                                }
+                                
+                                // Update PTY
+                                let _ = pty.resize(rows, cols);
+                                window.request_redraw();
+                                info!("Zoom out: font size {}", renderer.font_size());
+                            }
+                            // Cmd 0 (reset)
+                            PhysicalKey::Code(KeyCode::Digit0) => {
+                                renderer.set_font_size(DEFAULT_PT);
+                                
+                                // Recalculate cols/rows with new font size
+                                let size = window.inner_size();
+                                let cols = ((size.width as f32) / renderer.cell_width).floor().max(1.0) as u16;
+                                let rows = ((size.height as f32) / renderer.cell_height).floor().max(1.0) as u16;
+                                
+                                // Update grid
+                                {
+                                    let mut g = grid.lock().unwrap();
+                                    g.resize(cols as usize, rows as usize);
+                                }
+                                
+                                // Update PTY
+                                let _ = pty.resize(rows, cols);
+                                window.request_redraw();
+                                info!("Zoom reset: font size {}", DEFAULT_PT);
+                            }
+                            _ => {}
+                        }
+                        // Don't process normal input when Command is held
+                        return;
+                    }
+                    
                     // Handle special keys using physical key
                     let seq: Option<&[u8]> = match physical_key {
+                        PhysicalKey::Code(KeyCode::Space) => Some(b" "),  // Ensure space is sent
                         PhysicalKey::Code(KeyCode::Enter) => Some(b"\r"),
                         PhysicalKey::Code(KeyCode::Backspace) => Some(b"\x7f"),
                         PhysicalKey::Code(KeyCode::Tab) => Some(b"\t"),
@@ -138,6 +206,10 @@ async fn run(args: Args) -> Result<()> {
                         _ => {
                             // Handle regular characters via logical key
                             if let Key::Character(s) = logical_key {
+                                // Log what we're sending for debugging
+                                if s == " " {
+                                    info!("Sending space character to PTY");
+                                }
                                 if let Err(e) = pty.write(s.as_bytes()) {
                                     error!("Failed to write to PTY: {}", e);
                                 }

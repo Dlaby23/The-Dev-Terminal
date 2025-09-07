@@ -20,6 +20,9 @@ pub struct Renderer {
     text_atlas: TextAtlas,
     text_buffer: TextBuffer,
     pending_text: String,
+    font_size: f32,
+    pub cell_width: f32,
+    pub cell_height: f32,
 }
 
 impl Renderer {
@@ -84,7 +87,11 @@ impl Renderer {
             None,
         );
         
-        let mut text_buffer = TextBuffer::new(&mut font_system, Metrics::new(14.0, 18.0));
+        let font_size = 14.0;
+        let cell_width = font_size * 0.6;
+        let cell_height = font_size * 1.25;
+        
+        let mut text_buffer = TextBuffer::new(&mut font_system, Metrics::new(font_size, cell_height));
         text_buffer.set_size(&mut font_system, size.width as f32, size.height as f32);
         
         let pending_text = "Hello from The Dev Terminal\n(type will show once PTY is wired)".to_string();
@@ -100,6 +107,9 @@ impl Renderer {
             text_atlas,
             text_buffer,
             pending_text,
+            font_size,
+            cell_width,
+            cell_height,
         })
     }
     
@@ -120,6 +130,33 @@ impl Renderer {
     
     pub fn set_text(&mut self, s: impl Into<String>) {
         self.pending_text = s.into();
+    }
+    
+    pub fn font_size(&self) -> f32 {
+        self.font_size
+    }
+    
+    pub fn set_font_size(&mut self, pt: f32) {
+        const MIN_PT: f32 = 8.0;
+        const MAX_PT: f32 = 48.0;
+        
+        let pt = pt.clamp(MIN_PT, MAX_PT);
+        self.font_size = pt;
+        self.cell_width = pt * 0.6;
+        self.cell_height = pt * 1.25;
+        
+        // Update glyphon buffer metrics
+        self.text_buffer.set_metrics(
+            &mut self.font_system,
+            Metrics::new(self.font_size, self.cell_height)
+        );
+        
+        // Recompute buffer size to the window
+        self.text_buffer.set_size(
+            &mut self.font_system,
+            self.config.width as f32,
+            self.config.height as f32
+        );
     }
     
     pub fn render_frame(&mut self) -> Result<()> {
