@@ -111,8 +111,12 @@ async fn run(args: Args) -> Result<()> {
                     }
                     // Get text snapshot from grid
                     let snapshot = {
-                        let g = grid.lock().unwrap();
-                        g.to_string_lines()
+                        let mut g = grid.lock().unwrap();
+                        // Auto-scroll to bottom if we were at the bottom
+                        if g.scrollback.is_at_bottom() {
+                            g.scroll_to_bottom();
+                        }
+                        g.get_display_content()
                     };
                     renderer.set_text(snapshot);
                     window.request_redraw();
@@ -227,8 +231,10 @@ async fn run(args: Args) -> Result<()> {
                                 {
                                     let mut g = grid.lock().unwrap();
                                     g.clear_all();
+                                    g.scrollback.clear();
                                     g.x = 0;
                                     g.y = 0;
+                                    renderer.set_text(g.get_display_content());
                                 }
                                 window.request_redraw();
                                 // Ask shell to repaint prompt (Ctrl-L)
@@ -423,6 +429,38 @@ async fn run(args: Args) -> Result<()> {
                         PhysicalKey::Code(KeyCode::ArrowDown) => Some(b"\x1b[B"),
                         PhysicalKey::Code(KeyCode::ArrowRight) => Some(b"\x1b[C"),
                         PhysicalKey::Code(KeyCode::ArrowLeft) => Some(b"\x1b[D"),
+                        
+                        // Scrollback controls
+                        PhysicalKey::Code(KeyCode::PageUp) => {
+                            let mut g = grid.lock().unwrap();
+                            g.page_up();
+                            renderer.set_text(g.get_display_content());
+                            window.request_redraw();
+                            None
+                        }
+                        PhysicalKey::Code(KeyCode::PageDown) => {
+                            let mut g = grid.lock().unwrap();
+                            g.page_down();
+                            renderer.set_text(g.get_display_content());
+                            window.request_redraw();
+                            None
+                        }
+                        PhysicalKey::Code(KeyCode::Home) if modifiers.shift_key() => {
+                            // Shift+Home: scroll to top
+                            let mut g = grid.lock().unwrap();
+                            g.scrollback.scroll_to_top();
+                            renderer.set_text(g.get_display_content());
+                            window.request_redraw();
+                            None
+                        }
+                        PhysicalKey::Code(KeyCode::End) if modifiers.shift_key() => {
+                            // Shift+End: scroll to bottom
+                            let mut g = grid.lock().unwrap();
+                            g.scroll_to_bottom();
+                            renderer.set_text(g.get_display_content());
+                            window.request_redraw();
+                            None
+                        }
                         _ => {
                             // Handle regular characters via logical key
                             if let Key::Character(s) = logical_key {

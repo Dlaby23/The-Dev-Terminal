@@ -1,5 +1,5 @@
 use vte::{Params, Perform};
-use crate::grid::Grid;
+use crate::grid::{Grid, Color};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -97,8 +97,101 @@ impl<'a> Perform for Performer<'a> {
                 let n = params.iter().next().and_then(|p| p.first()).copied().unwrap_or(1) as usize;
                 self.g.x = self.g.x.saturating_sub(n);
             }
-            // SGR – ignore colors/styles for now
-            'm' => {}
+            // SGR – Select Graphic Rendition (colors and text attributes)
+            'm' => {
+                let mut params_iter = params.iter();
+                while let Some(param) = params_iter.next() {
+                    for n in param {
+                        match *n {
+                            0 => {
+                                // Reset all attributes
+                                self.g.current_fg = Color::default();
+                                self.g.current_bg = Color::BLACK;
+                                self.g.current_bold = false;
+                                self.g.current_italic = false;
+                                self.g.current_underline = false;
+                            }
+                            1 => self.g.current_bold = true,
+                            3 => self.g.current_italic = true,
+                            4 => self.g.current_underline = true,
+                            22 => self.g.current_bold = false,
+                            23 => self.g.current_italic = false,
+                            24 => self.g.current_underline = false,
+                            
+                            // Foreground colors
+                            30..=37 => self.g.current_fg = Color::from_ansi((*n - 30) as u8),
+                            38 => {
+                                // Extended foreground color
+                                if let Some(next_param) = params_iter.next() {
+                                    if let Some(&2) = next_param.first() {
+                                        // RGB color (38;2;r;g;b)
+                                        let r = params_iter.next()
+                                            .and_then(|p| p.first())
+                                            .copied()
+                                            .unwrap_or(0) as u8;
+                                        let g = params_iter.next()
+                                            .and_then(|p| p.first())
+                                            .copied()
+                                            .unwrap_or(0) as u8;
+                                        let b = params_iter.next()
+                                            .and_then(|p| p.first())
+                                            .copied()
+                                            .unwrap_or(0) as u8;
+                                        self.g.current_fg = Color { r, g, b };
+                                    } else if let Some(&5) = next_param.first() {
+                                        // 256 color (38;5;n)
+                                        if let Some(color_param) = params_iter.next() {
+                                            if let Some(&color) = color_param.first() {
+                                                self.g.current_fg = Color::from_ansi(color as u8);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            39 => self.g.current_fg = Color::default(), // Default foreground
+                            
+                            // Background colors
+                            40..=47 => self.g.current_bg = Color::from_ansi((*n - 40) as u8),
+                            48 => {
+                                // Extended background color
+                                if let Some(next_param) = params_iter.next() {
+                                    if let Some(&2) = next_param.first() {
+                                        // RGB color (48;2;r;g;b)
+                                        let r = params_iter.next()
+                                            .and_then(|p| p.first())
+                                            .copied()
+                                            .unwrap_or(0) as u8;
+                                        let g = params_iter.next()
+                                            .and_then(|p| p.first())
+                                            .copied()
+                                            .unwrap_or(0) as u8;
+                                        let b = params_iter.next()
+                                            .and_then(|p| p.first())
+                                            .copied()
+                                            .unwrap_or(0) as u8;
+                                        self.g.current_bg = Color { r, g, b };
+                                    } else if let Some(&5) = next_param.first() {
+                                        // 256 color (48;5;n)
+                                        if let Some(color_param) = params_iter.next() {
+                                            if let Some(&color) = color_param.first() {
+                                                self.g.current_bg = Color::from_ansi(color as u8);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            49 => self.g.current_bg = Color::BLACK, // Default background
+                            
+                            // Bright foreground colors
+                            90..=97 => self.g.current_fg = Color::from_ansi(((*n - 90) + 8) as u8),
+                            // Bright background colors
+                            100..=107 => self.g.current_bg = Color::from_ansi(((*n - 100) + 8) as u8),
+                            
+                            _ => {} // Ignore other SGR codes for now
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }

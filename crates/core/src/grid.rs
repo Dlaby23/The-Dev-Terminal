@@ -1,8 +1,84 @@
 use unicode_width::UnicodeWidthChar;
+use crate::scrollback::ScrollbackBuffer;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Color {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+impl Color {
+    pub const BLACK: Color = Color { r: 0, g: 0, b: 0 };
+    pub const RED: Color = Color { r: 205, g: 49, b: 49 };
+    pub const GREEN: Color = Color { r: 13, g: 188, b: 121 };
+    pub const YELLOW: Color = Color { r: 229, g: 229, b: 16 };
+    pub const BLUE: Color = Color { r: 36, g: 114, b: 200 };
+    pub const MAGENTA: Color = Color { r: 188, g: 63, b: 188 };
+    pub const CYAN: Color = Color { r: 17, g: 168, b: 205 };
+    pub const WHITE: Color = Color { r: 229, g: 229, b: 229 };
+    
+    // Bright colors
+    pub const BRIGHT_BLACK: Color = Color { r: 102, g: 102, b: 102 };
+    pub const BRIGHT_RED: Color = Color { r: 241, g: 76, b: 76 };
+    pub const BRIGHT_GREEN: Color = Color { r: 35, g: 209, b: 139 };
+    pub const BRIGHT_YELLOW: Color = Color { r: 245, g: 245, b: 67 };
+    pub const BRIGHT_BLUE: Color = Color { r: 59, g: 142, b: 234 };
+    pub const BRIGHT_MAGENTA: Color = Color { r: 214, g: 112, b: 214 };
+    pub const BRIGHT_CYAN: Color = Color { r: 41, g: 184, b: 219 };
+    pub const BRIGHT_WHITE: Color = Color { r: 255, g: 255, b: 255 };
+    
+    pub fn from_ansi(n: u8) -> Color {
+        match n {
+            0 => Color::BLACK,
+            1 => Color::RED,
+            2 => Color::GREEN,
+            3 => Color::YELLOW,
+            4 => Color::BLUE,
+            5 => Color::MAGENTA,
+            6 => Color::CYAN,
+            7 => Color::WHITE,
+            8 => Color::BRIGHT_BLACK,
+            9 => Color::BRIGHT_RED,
+            10 => Color::BRIGHT_GREEN,
+            11 => Color::BRIGHT_YELLOW,
+            12 => Color::BRIGHT_BLUE,
+            13 => Color::BRIGHT_MAGENTA,
+            14 => Color::BRIGHT_CYAN,
+            15 => Color::BRIGHT_WHITE,
+            // 256 color palette
+            16..=231 => {
+                // 6x6x6 color cube
+                let idx = n - 16;
+                let r = (idx / 36) * 51;
+                let g = ((idx / 6) % 6) * 51;
+                let b = (idx % 6) * 51;
+                Color { r, g, b }
+            }
+            232..=255 => {
+                // Grayscale
+                let gray = 8 + (n - 232) * 10;
+                Color { r: gray, g: gray, b: gray }
+            }
+            _ => Color::WHITE,
+        }
+    }
+}
+
+impl Default for Color {
+    fn default() -> Self {
+        Color::WHITE
+    }
+}
 
 #[derive(Clone, Copy, Default)]
 pub struct Cell { 
-    pub ch: char 
+    pub ch: char,
+    pub fg: Color,
+    pub bg: Color,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
 }
 
 pub struct Grid {
@@ -11,6 +87,13 @@ pub struct Grid {
     pub cells: Vec<Cell>,
     pub x: usize,
     pub y: usize,
+    pub scrollback: ScrollbackBuffer,
+    // Current text attributes
+    pub current_fg: Color,
+    pub current_bg: Color,
+    pub current_bold: bool,
+    pub current_italic: bool,
+    pub current_underline: bool,
 }
 
 impl Grid {
@@ -20,7 +103,13 @@ impl Grid {
             rows, 
             cells: vec![Cell::default(); cols * rows], 
             x: 0, 
-            y: 0 
+            y: 0,
+            scrollback: ScrollbackBuffer::new(10000), // 10k lines of scrollback
+            current_fg: Color::default(),
+            current_bg: Color::BLACK,
+            current_bold: false,
+            current_italic: false,
+            current_underline: false,
         }
     }
     
@@ -97,6 +186,11 @@ impl Grid {
         }
         let idx = self.y * self.cols + self.x;
         self.cells[idx].ch = ch;
+        self.cells[idx].fg = self.current_fg;
+        self.cells[idx].bg = self.current_bg;
+        self.cells[idx].bold = self.current_bold;
+        self.cells[idx].italic = self.current_italic;
+        self.cells[idx].underline = self.current_underline;
         self.x = (self.x + w).min(self.cols.saturating_sub(1));
     }
     
@@ -113,6 +207,13 @@ impl Grid {
         if self.y + 1 < self.rows { 
             self.y += 1; 
         } else {
+            // Save the top line to scrollback before scrolling
+            let mut line = Vec::with_capacity(self.cols);
+            for c in 0..self.cols {
+                line.push(self.cells[c]);
+            }
+            self.scrollback.push_line(line);
+            
             // scroll up by 1
             let cols = self.cols;
             self.cells.rotate_left(cols);
@@ -158,5 +259,68 @@ impl Grid {
         let miny = y0.min(y1);
         let maxy = y0.max(y1);
         (minx, miny, maxx, maxy)
+    }
+    
+    /// Get display content including scrollback if scrolled
+    pub fn get_display_content(&self) -> String {
+        if self.scrollback.scroll_offset > 0 {
+            // We're scrolled - show scrollback content
+            let scrollback_lines = self.scrollback.get_visible_lines(self.rows);
+            let mut s = String::new();
+            
+            for line in scrollback_lines {
+                for cell in line {
+                    s.push(if cell.ch == '\0' { ' ' } else { cell.ch });
+                }
+                s.push('\n');
+            }
+            
+            // If we have fewer scrollback lines than viewport, show current grid too
+            let remaining_rows = self.rows.saturating_sub(self.scrollback.len());
+            if remaining_rows > 0 && self.scrollback.scroll_offset < self.scrollback.len() {
+                for r in 0..remaining_rows.min(self.rows) {
+                    for c in 0..self.cols {
+                        let ch = self.cells[self.idx(c, r)].ch;
+                        s.push(if ch == '\0' { ' ' } else { ch });
+                    }
+                    s.push('\n');
+                }
+            }
+            
+            s
+        } else {
+            // Normal view - show current grid
+            self.to_string_lines()
+        }
+    }
+    
+    /// Scroll up in the scrollback
+    pub fn scroll_up(&mut self, lines: usize) {
+        self.scrollback.scroll_up(lines);
+    }
+    
+    /// Scroll down in the scrollback
+    pub fn scroll_down(&mut self, lines: usize) {
+        self.scrollback.scroll_down(lines);
+    }
+    
+    /// Page up
+    pub fn page_up(&mut self) {
+        self.scrollback.page_up(self.rows);
+    }
+    
+    /// Page down
+    pub fn page_down(&mut self) {
+        self.scrollback.page_down(self.rows);
+    }
+    
+    /// Check if we're viewing scrollback
+    pub fn is_scrolled(&self) -> bool {
+        self.scrollback.scroll_offset > 0
+    }
+    
+    /// Jump to bottom (exit scrollback view)
+    pub fn scroll_to_bottom(&mut self) {
+        self.scrollback.scroll_to_bottom();
     }
 }
