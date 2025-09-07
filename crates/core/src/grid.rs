@@ -33,6 +33,45 @@ impl Grid {
         self.y = 0;
     }
     
+    pub fn resize_preserve(&mut self, new_cols: usize, new_rows: usize) {
+        if new_cols == self.cols && new_rows == self.rows { 
+            return; 
+        }
+
+        let old_cols = self.cols;
+        let old_rows = self.rows;
+        let old_cells = std::mem::take(&mut self.cells);
+
+        self.cols = new_cols;
+        self.rows = new_rows;
+        self.cells = vec![Cell::default(); new_cols * new_rows];
+
+        let keep_rows = old_rows.min(new_rows);
+        let keep_cols = old_cols.min(new_cols);
+
+        // Copy overlapping area, bottom-aligned like real terminals
+        for r in 0..keep_rows {
+            let src_r = old_rows - keep_rows + r;
+            let dst_r = new_rows - keep_rows + r;
+
+            // Copy only the overlapping width (left aligned)
+            for c in 0..keep_cols {
+                let src_idx = src_r * old_cols + c;
+                let dst_idx = dst_r * new_cols + c;
+                self.cells[dst_idx] = old_cells[src_idx];
+            }
+            // Remaining columns (if any) are already spaces
+        }
+
+        // Clamp cursor into bounds, don't reset it
+        if self.y >= self.rows { 
+            self.y = self.rows.saturating_sub(1); 
+        }
+        if self.x >= self.cols { 
+            self.x = self.cols.saturating_sub(1); 
+        }
+    }
+    
     fn idx(&self, x: usize, y: usize) -> usize { 
         y * self.cols + x 
     }
@@ -94,5 +133,30 @@ impl Grid {
             s.push('\n');
         }
         s
+    }
+    
+    pub fn get_text_in_region(&self, x0: usize, y0: usize, x1: usize, y1: usize) -> String {
+        let mut s = String::new();
+        for row in y0..=y1 {
+            for col in x0..=x1 {
+                let idx = self.idx(col.min(self.cols-1), row.min(self.rows-1));
+                let ch = self.cells[idx].ch;
+                s.push(if ch == '\0' { ' ' } else { ch });
+            }
+            if row < y1 {
+                s.push('\n');
+            }
+        }
+        s
+    }
+    
+    pub fn selection_bounds(&self, start: (usize, usize), end: (usize, usize)) -> (usize, usize, usize, usize) {
+        let (x0, y0) = start;
+        let (x1, y1) = end;
+        let minx = x0.min(x1);
+        let maxx = x0.max(x1);
+        let miny = y0.min(y1);
+        let maxy = y0.max(y1);
+        (minx, miny, maxx, maxy)
     }
 }

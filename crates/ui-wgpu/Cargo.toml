@@ -15,6 +15,7 @@ tokio = { workspace = true }
 raw-window-handle = { workspace = true }
 glyphon = "0.5"
 cosmic-text = "0.10"
+bytemuck = { version = "1.14", features = ["derive"] }
 
 [lib]
 name = "the_dev_terminal_ui_wgpu"

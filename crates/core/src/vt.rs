@@ -1,8 +1,11 @@
 use vte::{Params, Perform};
 use crate::grid::Grid;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct Performer<'a> { 
-    pub g: &'a mut Grid 
+    pub g: &'a mut Grid,
+    pub bracketed_paste: Option<Arc<AtomicBool>>,
 }
 
 impl<'a> Perform for Performer<'a> {
@@ -35,7 +38,23 @@ impl<'a> Perform for Performer<'a> {
     }
 
     // CSI sequences (ESC [ ... )
-    fn csi_dispatch(&mut self, params: &Params, _inter: &[u8], _ignore: bool, c: char) {
+    fn csi_dispatch(&mut self, params: &Params, inter: &[u8], _ignore: bool, c: char) {
+        // Handle DEC private mode set/reset (CSI ? ... h/l)
+        if inter == b"?" {
+            let is_set = c == 'h';
+            for param in params.iter() {
+                for n in param {
+                    if *n == 2004 {
+                        // Bracketed paste mode
+                        if let Some(ref bp) = self.bracketed_paste {
+                            bp.store(is_set, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        
         match c {
             // ED – erase in display (0 or 2)
             'J' => {
@@ -97,9 +116,13 @@ impl<'a> Perform for Performer<'a> {
 }
 
 pub fn advance_bytes(g: &mut Grid, bytes: &[u8]) {
+    advance_bytes_with_bracketed(g, bytes, None);
+}
+
+pub fn advance_bytes_with_bracketed(g: &mut Grid, bytes: &[u8], bracketed_paste: Option<Arc<AtomicBool>>) {
     static PARSER: std::sync::OnceLock<std::sync::Mutex<vte::Parser>> = std::sync::OnceLock::new();
     let mut parser = PARSER.get_or_init(|| std::sync::Mutex::new(vte::Parser::new())).lock().unwrap();
-    let mut p = Performer { g };
+    let mut p = Performer { g, bracketed_paste };
     for &b in bytes { 
         parser.advance(&mut p, b); 
     }
