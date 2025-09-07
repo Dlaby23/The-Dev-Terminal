@@ -151,6 +151,30 @@ async fn run(args: Args) -> Result<()> {
                     }
                 }
                 
+                WindowEvent::MouseWheel { delta, .. } => {
+                    let lines = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_x, y) => {
+                            // Invert scroll direction for natural scrolling
+                            (-y * 3.0) as isize
+                        }
+                        winit::event::MouseScrollDelta::PixelDelta(p) => {
+                            // Convert pixels to lines (invert for natural scrolling)
+                            (-p.y / renderer.cell_height as f64).round() as isize
+                        }
+                    };
+                    
+                    if lines != 0 {
+                        let mut g = grid.lock().unwrap();
+                        if lines > 0 {
+                            g.scroll_up(lines.abs() as usize);
+                        } else {
+                            g.scroll_down(lines.abs() as usize);
+                        }
+                        renderer.set_text(g.get_display_content());
+                        window.request_redraw();
+                    }
+                }
+                
                 WindowEvent::MouseInput { state, button, .. } => {
                     if button == MouseButton::Left {
                         if state == ElementState::Pressed {
@@ -222,7 +246,7 @@ async fn run(args: Args) -> Result<()> {
                     // Handle Command-based shortcuts (macOS)
                     if modifiers.super_key() {
                         const STEP_PT: f32 = 1.0;
-                        const DEFAULT_PT: f32 = 14.0;
+                        const DEFAULT_PT: f32 = 18.0;
                         
                         match physical_key {
                             // Clear screen + scrollback: ⌘K

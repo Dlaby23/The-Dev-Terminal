@@ -110,7 +110,7 @@ impl Renderer {
             None,
         );
         
-        let font_size = 14.0;
+        let font_size = 18.0;
         let cell_width = font_size * 0.6;
         let cell_height = font_size * 1.25;
         

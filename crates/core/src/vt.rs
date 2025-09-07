@@ -50,23 +50,56 @@ impl<'a> Perform for Performer<'a> {
                             bp.store(is_set, Ordering::Relaxed);
                         }
                     }
+                    // TODO: handle ?25h/?25l for cursor visible later
                 }
             }
             return;
         }
         
         match c {
-            // ED – erase in display (0 or 2)
+            // ED (Erase in Display) 0/1/2
+            //   CSI 0 J  -> clear from cursor to end of screen
+            //   CSI 1 J  -> clear from start of screen to cursor
+            //   CSI 2 J  -> clear entire screen (and, by convention, home cursor)
             'J' => {
                 let n = params.iter().next().and_then(|p| p.first()).copied().unwrap_or(0);
-                if n == 2 { 
-                    self.g.clear_all(); 
+                match n {
+                    0 => { // clear from cursor to end of screen
+                        // clear current line from cursor to end
+                        self.g.clear_eol_from_cursor();
+                        // clear all lines below
+                        for row in (self.g.y + 1)..self.g.rows {
+                            self.g.clear_line(row);
+                        }
+                    }
+                    1 => { // clear from start to cursor (inclusive)
+                        // clear all lines above
+                        for row in 0..self.g.y {
+                            self.g.clear_line(row);
+                        }
+                        // clear beginning of current line up to cursor
+                        self.g.clear_bol_to_cursor();
+                    }
+                    2 => { // clear entire screen and home cursor (typical terminal behavior)
+                        self.g.clear_all();
+                        self.g.x = 0;
+                        self.g.y = 0;
+                    }
+                    _ => {}
                 }
-                // (0 and 1 can be added later)
             }
-            // EL – erase in line (0)
-            'K' => { 
-                self.g.clear_eol(); 
+            // EL (Erase in Line) 0/1/2
+            //   CSI 0 K  -> clear from cursor to end of line
+            //   CSI 1 K  -> clear from start of line to cursor
+            //   CSI 2 K  -> clear entire line
+            'K' => {
+                let n = params.iter().next().and_then(|p| p.first()).copied().unwrap_or(0);
+                match n {
+                    0 => self.g.clear_eol_from_cursor(),
+                    1 => self.g.clear_bol_to_cursor(),
+                    2 => self.g.clear_line(self.g.y),
+                    _ => {}
+                }
             }
             // CUP – cursor position: 1-based row;col
             'H' | 'f' => {

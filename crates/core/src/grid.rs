@@ -55,12 +55,12 @@ impl Color {
                 let b = (idx % 6) * 51;
                 Color { r, g, b }
             }
-            232..=255 => {
+            // Grayscale (232..=255 covers all remaining values)
+            _ => {
                 // Grayscale
                 let gray = 8 + (n - 232) * 10;
                 Color { r: gray, g: gray, b: gray }
             }
-            _ => Color::WHITE,
         }
     }
 }
@@ -176,6 +176,33 @@ impl Grid {
         let end = self.idx(self.cols - 1, self.y) + 1;
         for i in start..end { 
             self.cells[i] = Cell::default(); 
+        }
+    }
+    
+    pub fn clear_line(&mut self, row: usize) {
+        let row = row.min(self.rows.saturating_sub(1));
+        let start = row * self.cols;
+        let end = start + self.cols;
+        for c in &mut self.cells[start..end] { 
+            *c = Cell::default(); 
+        }
+    }
+    
+    pub fn clear_eol_from_cursor(&mut self) {
+        let row = self.y.min(self.rows.saturating_sub(1));
+        let start = row * self.cols + self.x.min(self.cols.saturating_sub(1));
+        let end = row * self.cols + self.cols;
+        for c in &mut self.cells[start..end] { 
+            *c = Cell::default(); 
+        }
+    }
+    
+    pub fn clear_bol_to_cursor(&mut self) {
+        let row = self.y.min(self.rows.saturating_sub(1));
+        let start = row * self.cols;
+        let end = row * self.cols + self.x.min(self.cols.saturating_sub(1)) + 1;
+        for c in &mut self.cells[start..end] { 
+            *c = Cell::default(); 
         }
     }
     
