@@ -10,7 +10,7 @@ use tracing_subscriber;
 use winit::{
     event::{Event, WindowEvent, ElementState, KeyEvent},
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
-    keyboard::{Key, NamedKey},
+    keyboard::{Key, KeyCode, PhysicalKey},
     window::WindowBuilder,
 };
 
@@ -24,7 +24,6 @@ struct Args {
 #[derive(Debug, Clone)]
 enum UserEvent {
     PtyData(Vec<u8>),
-    RequestRedraw,
 }
 
 fn main() -> Result<()> {
@@ -58,6 +57,15 @@ async fn run(args: Args) -> Result<()> {
     
     spawn_pty_reader(pty_rx, proxy.clone());
     
+    // Test command injection to verify typing works
+    if !args.smoketest {
+        let pty_test = pty.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let _ = pty_test.write(b"echo 'Terminal OK' && printf \"\\n\"\r");
+        });
+    }
+    
     let mut frame_count = 0;
     let start_time = Instant::now();
     
@@ -80,9 +88,6 @@ async fn run(args: Args) -> Result<()> {
                     renderer.set_text(snapshot);
                     window.request_redraw();
                 }
-                UserEvent::RequestRedraw => {
-                    window.request_redraw();
-                }
             },
             
             Event::WindowEvent { event, .. } => match event {
@@ -94,9 +99,11 @@ async fn run(args: Args) -> Result<()> {
                 WindowEvent::Resized(physical_size) => {
                     renderer.resize(physical_size);
                     
-                    // Estimate cell size (roughly)
-                    let cols = (physical_size.width / 10).max(20) as u16;
-                    let rows = (physical_size.height / 20).max(10) as u16;
+                    // Calculate cells based on font metrics (estimated)
+                    const CELL_WIDTH: f32 = 9.0;
+                    const CELL_HEIGHT: f32 = 18.0;
+                    let cols = ((physical_size.width as f32) / CELL_WIDTH).floor().max(1.0) as u16;
+                    let rows = ((physical_size.height as f32) / CELL_HEIGHT).floor().max(1.0) as u16;
                     
                     // Update grid
                     {
@@ -106,17 +113,44 @@ async fn run(args: Args) -> Result<()> {
                     
                     // Update PTY
                     let _ = pty.resize(rows, cols);
+                    window.request_redraw();
                 }
                 
                 WindowEvent::KeyboardInput {
                     event: KeyEvent {
                         state: ElementState::Pressed,
                         logical_key,
+                        physical_key,
                         ..
                     },
                     ..
                 } => {
-                    handle_keyboard_input(&pty, logical_key);
+                    // Handle special keys using physical key
+                    let seq: Option<&[u8]> = match physical_key {
+                        PhysicalKey::Code(KeyCode::Enter) => Some(b"\r"),
+                        PhysicalKey::Code(KeyCode::Backspace) => Some(b"\x7f"),
+                        PhysicalKey::Code(KeyCode::Tab) => Some(b"\t"),
+                        PhysicalKey::Code(KeyCode::Escape) => Some(b"\x1b"),
+                        PhysicalKey::Code(KeyCode::ArrowUp) => Some(b"\x1b[A"),
+                        PhysicalKey::Code(KeyCode::ArrowDown) => Some(b"\x1b[B"),
+                        PhysicalKey::Code(KeyCode::ArrowRight) => Some(b"\x1b[C"),
+                        PhysicalKey::Code(KeyCode::ArrowLeft) => Some(b"\x1b[D"),
+                        _ => {
+                            // Handle regular characters via logical key
+                            if let Key::Character(s) = logical_key {
+                                if let Err(e) = pty.write(s.as_bytes()) {
+                                    error!("Failed to write to PTY: {}", e);
+                                }
+                            }
+                            None
+                        }
+                    };
+                    
+                    if let Some(s) = seq {
+                        if let Err(e) = pty.write(s) {
+                            error!("Failed to write to PTY: {}", e);
+                        }
+                    }
                 }
                 
                 WindowEvent::RedrawRequested => {
@@ -170,23 +204,4 @@ fn spawn_pty_reader(mut pty_rx: mpsc::UnboundedReceiver<Vec<u8>>, proxy: EventLo
             let _ = proxy.send_event(UserEvent::PtyData(data));
         }
     });
-}
-
-fn handle_keyboard_input(pty: &PtyHandle, key: Key) {
-    let bytes = match key {
-        Key::Named(NamedKey::Enter) => vec![b'\r'],
-        Key::Named(NamedKey::Backspace) => vec![0x7f],
-        Key::Named(NamedKey::Tab) => vec![b'\t'],
-        Key::Named(NamedKey::Escape) => vec![0x1b],
-        Key::Named(NamedKey::ArrowUp) => vec![0x1b, b'[', b'A'],
-        Key::Named(NamedKey::ArrowDown) => vec![0x1b, b'[', b'B'],
-        Key::Named(NamedKey::ArrowRight) => vec![0x1b, b'[', b'C'],
-        Key::Named(NamedKey::ArrowLeft) => vec![0x1b, b'[', b'D'],
-        Key::Character(ref s) => s.as_bytes().to_vec(),
-        _ => return,
-    };
-    
-    if let Err(e) = pty.write(&bytes) {
-        error!("Failed to write to PTY: {}", e);
-    }
 }

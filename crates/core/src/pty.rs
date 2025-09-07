@@ -7,7 +7,7 @@ use tracing::{info, error};
 
 pub struct PtyHandle {
     master: Box<dyn MasterPty + Send>,
-    child: Box<dyn Child + Send + Sync>,
+    _child: Box<dyn Child + Send + Sync>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
 }
 
@@ -59,7 +59,7 @@ impl PtyHandle {
         Ok((
             Self {
                 master: pair.master,
-                child,
+                _child: child,
                 writer,
             },
             rx,

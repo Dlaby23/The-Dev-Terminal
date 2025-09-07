@@ -13,7 +13,6 @@ pub struct Renderer {
     pub queue: Queue,
     pub surface: Surface<'static>,
     pub config: SurfaceConfiguration,
-    window: Arc<Window>,
     // Text rendering
     font_system: FontSystem,
     swash_cache: SwashCache,
@@ -95,7 +94,6 @@ impl Renderer {
             queue,
             surface,
             config,
-            window,
             font_system,
             swash_cache,
             text_renderer,
