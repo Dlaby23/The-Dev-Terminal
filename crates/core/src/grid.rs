@@ -289,6 +289,35 @@ impl Grid {
     }
     
     /// Get display content including scrollback if scrolled
+    pub fn get_cells_for_display(&self) -> Vec<Cell> {
+        if self.scrollback.scroll_offset > 0 {
+            // We're scrolled - show scrollback content
+            let scrollback_lines = self.scrollback.get_visible_lines(self.rows);
+            let mut cells = Vec::new();
+            
+            for line in scrollback_lines {
+                for cell in line {
+                    cells.push(cell);
+                }
+            }
+            
+            // If we have fewer scrollback lines than viewport, show current grid too
+            let remaining_rows = self.rows.saturating_sub(self.scrollback.len());
+            if remaining_rows > 0 && self.scrollback.scroll_offset < self.scrollback.len() {
+                for r in 0..remaining_rows.min(self.rows) {
+                    for c in 0..self.cols {
+                        cells.push(self.cells[self.idx(c, r)]);
+                    }
+                }
+            }
+            
+            cells
+        } else {
+            // Normal view - return current grid cells
+            self.cells.clone()
+        }
+    }
+    
     pub fn get_display_content(&self) -> String {
         if self.scrollback.scroll_offset > 0 {
             // We're scrolled - show scrollback content

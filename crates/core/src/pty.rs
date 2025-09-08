@@ -25,6 +25,7 @@ impl PtyHandle {
         let pair = pty_system.openpty(pty_size)?;
         let mut cmd = CommandBuilder::new("/bin/zsh");
         cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
         
         let child = pair.slave.spawn_command(cmd)?;
         info!("Spawned zsh with PID: {:?}", child.process_id());

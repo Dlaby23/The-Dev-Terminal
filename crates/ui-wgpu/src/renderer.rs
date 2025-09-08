@@ -8,6 +8,8 @@ use glyphon::{
     TextRenderer as GlyphonRenderer, TextAtlas, TextArea, TextBounds,
     Resolution
 };
+use crate::colored_text::ColoredTextRenderer;
+use the_dev_terminal_core::grid::Cell;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -34,6 +36,10 @@ pub struct Renderer {
     text_atlas: TextAtlas,
     text_buffer: TextBuffer,
     pending_text: String,
+    pending_cells: Vec<Cell>,
+    pending_cols: usize,
+    pending_rows: usize,
+    colored_text_renderer: ColoredTextRenderer,
     font_size: f32,
     pub cell_width: f32,
     pub cell_height: f32,
@@ -42,10 +48,17 @@ pub struct Renderer {
     // Selection pipeline state
     sel_pipeline: RenderPipeline,
     sel_bindgroup: BindGroup,
-    sel_bind_layout: BindGroupLayout,
+    _sel_bind_layout: BindGroupLayout,
     sel_screen_ubo: Buffer,
     sel_vbuf: Buffer,
     sel_vertices: Vec<QuadVertex>,
+    // Viewport controls for smooth scrolling
+    pub viewport_top_row: usize,
+    pub y_offset_px: f32,
+    // Cursor position
+    pub cursor_x: usize,
+    pub cursor_y: usize,
+    pub cursor_visible: bool,
 }
 
 impl Renderer {
@@ -202,10 +215,13 @@ impl Renderer {
         // dynamic vertex buffer (we'll rebuild each frame as needed)
         let sel_vbuf = device.create_buffer(&BufferDescriptor {
             label: Some("sel.vbuf"),
-            size: (std::mem::size_of::<QuadVertex>() * 6 * 1024) as BufferAddress, // up to 1024 rects
+            size: (std::mem::size_of::<QuadVertex>() * 6 * 32768) as BufferAddress, // up to 32k rects for large terminals
             usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        
+        // Create the colored text renderer
+        let colored_text_renderer = ColoredTextRenderer::new(&device, &queue, config.format);
         
         Ok(Self {
             device,
@@ -218,16 +234,25 @@ impl Renderer {
             text_atlas,
             text_buffer,
             pending_text,
+            pending_cells: Vec::new(),
+            pending_cols: 0,
+            pending_rows: 0,
+            colored_text_renderer,
             font_size,
             cell_width,
             cell_height,
             selection: None,
             sel_pipeline,
-            sel_bind_layout,
+            _sel_bind_layout: sel_bind_layout,
             sel_bindgroup,
             sel_screen_ubo,
             sel_vbuf,
-            sel_vertices: Vec::with_capacity(6 * 64),
+            sel_vertices: Vec::with_capacity(6 * 4096),
+            viewport_top_row: 0,
+            y_offset_px: 0.0,
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_visible: true,
         })
     }
     
@@ -252,6 +277,23 @@ impl Renderer {
     
     pub fn set_text(&mut self, s: impl Into<String>) {
         self.pending_text = s.into();
+    }
+    
+    pub fn set_cells(&mut self, cells: Vec<Cell>, cols: usize, rows: usize) {
+        self.pending_cells = cells;
+        self.pending_cols = cols;
+        self.pending_rows = rows;
+    }
+    
+    pub fn set_viewport(&mut self, top_row: usize, y_offset_px: f32) {
+        self.viewport_top_row = top_row;
+        self.y_offset_px = y_offset_px;
+    }
+    
+    pub fn set_cursor(&mut self, x: usize, y: usize, visible: bool) {
+        self.cursor_x = x;
+        self.cursor_y = y;
+        self.cursor_visible = visible;
     }
     
     pub fn font_size(&self) -> f32 {
@@ -352,7 +394,44 @@ impl Renderer {
             });
         }
 
-        // 2) push selection rects
+        // 2) Draw colored cell backgrounds
+        if !self.pending_cells.is_empty() {
+            let visible_rows = (self.config.height as f32 / self.cell_height) as usize + 2;
+            let visible_cols = (self.config.width as f32 / self.cell_width) as usize + 2;
+            
+            for row in 0..visible_rows.min(self.pending_rows) {
+                for col in 0..visible_cols.min(self.pending_cols) {
+                    let idx = row * self.pending_cols + col;
+                    if idx >= self.pending_cells.len() {
+                        break;
+                    }
+                    
+                    let cell = &self.pending_cells[idx];
+                    // Only draw background if it's not the default black
+                    if cell.bg.r != 0 || cell.bg.g != 0 || cell.bg.b != 0 {
+                        let x = 12.0 + col as f32 * self.cell_width;
+                        let y = 12.0 + row as f32 * self.cell_height + self.y_offset_px;
+                        let color = [
+                            cell.bg.r as f32 / 255.0,
+                            cell.bg.g as f32 / 255.0,
+                            cell.bg.b as f32 / 255.0,
+                            1.0,
+                        ];
+                        self.push_rect(x, y, self.cell_width, self.cell_height, color);
+                    }
+                }
+            }
+        }
+        
+        // 3) Draw cursor if visible
+        if self.cursor_visible {
+            let cursor_x = 12.0 + self.cursor_x as f32 * self.cell_width;
+            let cursor_y = 12.0 + self.cursor_y as f32 * self.cell_height + self.y_offset_px;
+            // Draw cursor as a bright block
+            self.push_rect(cursor_x, cursor_y, self.cell_width, self.cell_height, [0.9, 0.9, 0.9, 0.8]);
+        }
+        
+        // 4) push selection rects (with viewport offset)
         if let Some(((x0, y0), (x1, y1))) = self.selection {
             let minx = x0.min(x1);
             let maxx = x0.max(x1);
@@ -367,17 +446,19 @@ impl Renderer {
                 
                 for col in start_col..=end_col {
                     let x = 12.0 + col as f32 * self.cell_width;
-                    let y = 12.0 + row as f32 * self.cell_height;
+                    // Apply y_offset_px for smooth scrolling
+                    let y = 12.0 + row as f32 * self.cell_height + self.y_offset_px;
                     // Semi-transparent blue selection background
                     self.push_rect(x, y, self.cell_width, self.cell_height, [0.2, 0.4, 0.8, 0.3]);
                 }
             }
         }
         
-        // Flush selection rectangles
+        // Flush selection and cursor rectangles
         self.flush_rects(&mut encoder, &view);
 
-        // 3) draw text on top
+        // 5) draw text on top
+        // For now, use glyphon for text rendering until we implement proper glyph atlas
         self.text_buffer.set_text(
             &mut self.font_system,
             &self.pending_text,
@@ -388,7 +469,7 @@ impl Renderer {
         let text_areas = vec![TextArea {
             buffer: &self.text_buffer,
             left: 12.0,
-            top: 12.0,
+            top: 12.0 + self.y_offset_px,
             scale: 1.0,
             bounds: TextBounds {
                 left: 0,

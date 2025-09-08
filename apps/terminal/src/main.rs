@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info};
 use tracing_subscriber;
 use winit::{
-    event::{Event, WindowEvent, ElementState, KeyEvent, MouseButton},
+    event::{Event, WindowEvent, ElementState, KeyEvent, MouseButton, MouseScrollDelta},
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
     keyboard::{Key, KeyCode, PhysicalKey, ModifiersState},
     window::WindowBuilder,
@@ -38,6 +38,25 @@ struct Region {
 struct SelectionState {
     dragging: bool,              // true only while mouse is down
     region: Option<Region>,      // current selection to render/copy
+    last_click_time: Option<std::time::Instant>,
+    last_click_pos: Option<(usize, usize)>,
+    click_count: usize,          // For double/triple click detection
+}
+
+struct ScrollState {
+    top_abs: usize,              // Absolute top row position (single source of truth)
+    subrow: f32,                 // Fractional row offset in rows (not pixels)
+    vel_rows_per_s: f32,         // Current scroll velocity for inertia
+    stick_to_bottom: bool,       // Auto-scroll when new content arrives
+    last_t: Instant,             // For delta time calculation
+}
+
+#[derive(Default)]
+struct SearchState {
+    active: bool,                // Is search mode active
+    query: String,               // Current search query
+    matches: Vec<(usize, usize, usize, usize)>, // (start_col, start_row, end_col, end_row)
+    current_match: Option<usize>, // Index of currently highlighted match
 }
 
 fn pixels_to_cell(x: f32, y: f32, cw: f32, ch: f32) -> (usize, usize) {
@@ -54,6 +73,96 @@ fn copy_to_clipboard(s: &str) {
 
 fn paste_from_clipboard() -> Option<String> {
     ClipboardContext::new().ok()?.get_contents().ok()
+}
+
+fn find_word_boundaries(grid: &Grid, col: usize, row: usize) -> (usize, usize) {
+    // Find word boundaries at the given position
+    let line_start = row * grid.cols;
+    
+    // Helper to check if a character is a word boundary
+    let is_word_char = |ch: char| ch.is_alphanumeric() || ch == '_';
+    
+    let mut start = col;
+    let mut end = col;
+    
+    // If we're not on a word character, return the single position
+    let idx = line_start + col;
+    if idx >= grid.cells.len() || !is_word_char(grid.cells[idx].ch) {
+        return (col, col);
+    }
+    
+    // Find start of word
+    while start > 0 {
+        let idx = line_start + start - 1;
+        if idx >= grid.cells.len() || !is_word_char(grid.cells[idx].ch) {
+            break;
+        }
+        start -= 1;
+    }
+    
+    // Find end of word
+    while end < grid.cols - 1 {
+        let idx = line_start + end + 1;
+        if idx >= grid.cells.len() || !is_word_char(grid.cells[idx].ch) {
+            break;
+        }
+        end += 1;
+    }
+    
+    (start, end)
+}
+
+fn find_line_boundaries(grid: &Grid, row: usize) -> (usize, usize) {
+    // Find the actual content boundaries of a line (trimming trailing spaces)
+    let line_start = row * grid.cols;
+    let mut end_col = grid.cols - 1;
+    
+    // Find last non-space character
+    while end_col > 0 {
+        let idx = line_start + end_col;
+        if idx < grid.cells.len() && grid.cells[idx].ch != ' ' && grid.cells[idx].ch != '\0' {
+            break;
+        }
+        end_col -= 1;
+    }
+    
+    (0, end_col)
+}
+
+fn detect_url_at_position(grid: &Grid, col: usize, row: usize) -> Option<String> {
+    // Simple URL detection - look for http:// or https:// patterns
+    let line_start = row * grid.cols;
+    let mut text = String::new();
+    
+    // Collect the line text
+    for c in 0..grid.cols {
+        let idx = line_start + c;
+        if idx < grid.cells.len() {
+            let ch = grid.cells[idx].ch;
+            if ch != '\0' {
+                text.push(ch);
+            }
+        }
+    }
+    
+    // Look for URLs in the text
+    let url_prefixes = ["http://", "https://", "ftp://", "file://"];
+    for prefix in &url_prefixes {
+        if let Some(start_idx) = text.find(prefix) {
+            if col >= start_idx && col < start_idx + text[start_idx..].len() {
+                // Find the end of the URL
+                let url_start = start_idx;
+                let remaining = &text[start_idx..];
+                let url_end = remaining.find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '>' || c == ')' || c == ']')
+                    .unwrap_or(remaining.len());
+                
+                let url = &text[url_start..url_start + url_end];
+                return Some(url.to_string());
+            }
+        }
+    }
+    
+    None
 }
 
 fn main() -> Result<()> {
@@ -76,7 +185,7 @@ async fn run(args: Args) -> Result<()> {
             .build(&event_loop)?
     );
     
-    let mut renderer = Renderer::new(window.clone()).await?;
+    let renderer = Arc::new(Mutex::new(Renderer::new(window.clone()).await?));
     
     let grid = Arc::new(Mutex::new(Grid::new(80, 25)));
     
@@ -95,6 +204,18 @@ async fn run(args: Args) -> Result<()> {
     let mut selection_text: Option<String> = None;
     let mut cursor_position = (0.0, 0.0);
     
+    // Search state
+    let mut search = SearchState::default();
+    
+    // Initialize scroll state - stick to bottom by default
+    let scroll = Arc::new(Mutex::new(ScrollState {
+        top_abs: 0,
+        subrow: 0.0,
+        vel_rows_per_s: 0.0,
+        stick_to_bottom: true,
+        last_t: Instant::now(),
+    }));
+    
     // Bracketed paste state (updated by VT parser when it sees CSI ? 2004 h/l)
     let bracketed_paste_enabled = Arc::new(AtomicBool::new(false));
     
@@ -109,16 +230,34 @@ async fn run(args: Args) -> Result<()> {
                         let mut g = grid.lock().unwrap();
                         advance_bytes_with_bracketed(&mut g, &data, Some(bracketed_paste_enabled.clone()));
                     }
-                    // Get text snapshot from grid
-                    let snapshot = {
-                        let mut g = grid.lock().unwrap();
-                        // Auto-scroll to bottom if we were at the bottom
-                        if g.scrollback.is_at_bottom() {
-                            g.scroll_to_bottom();
+                    
+                    // Update scroll position if stick-to-bottom is enabled
+                    {
+                        let g = grid.lock().unwrap();
+                        let total = g.scrollback.len() + g.rows;
+                        let vis = g.rows;
+                        let max_top = total.saturating_sub(vis);
+                        
+                        let mut s = scroll.lock().unwrap();
+                        if s.stick_to_bottom {
+                            s.top_abs = max_top;
+                            s.subrow = 0.0;
+                        } else {
+                            // Keep viewport valid if content grew
+                            s.top_abs = s.top_abs.min(max_top);
                         }
-                        g.get_display_content()
-                    };
-                    renderer.set_text(snapshot);
+                    }
+                    
+                    // Get text snapshot from grid and update cursor
+                    {
+                        let g = grid.lock().unwrap();
+                        let cells = g.get_cells_for_display();
+                        let snapshot = g.get_display_content();
+                        let mut r = renderer.lock().unwrap();
+                        r.set_cells(cells, g.cols, g.rows);
+                        r.set_text(snapshot);
+                        r.set_cursor(g.x, g.y, true);
+                    }
                     window.request_redraw();
                 }
             },
@@ -138,11 +277,15 @@ async fn run(args: Args) -> Result<()> {
                     // If dragging, update selection end
                     if selection.dragging {
                         if let Some(mut region) = selection.region {
+                            let (cw, ch) = {
+                                let r = renderer.lock().unwrap();
+                                (r.cell_width, r.cell_height)
+                            };
                             let (col, row) = pixels_to_cell(
                                 cursor_position.0,
                                 cursor_position.1,
-                                renderer.cell_width,
-                                renderer.cell_height
+                                cw,
+                                ch
                             );
                             region.end = (col, row);
                             selection.region = Some(region);
@@ -152,44 +295,115 @@ async fn run(args: Args) -> Result<()> {
                 }
                 
                 WindowEvent::MouseWheel { delta, .. } => {
-                    let lines = match delta {
-                        winit::event::MouseScrollDelta::LineDelta(_x, y) => {
-                            // Invert scroll direction for natural scrolling
-                            (-y * 3.0) as isize
-                        }
-                        winit::event::MouseScrollDelta::PixelDelta(p) => {
-                            // Convert pixels to lines (invert for natural scrolling)
-                            (-p.y / renderer.cell_height as f64).round() as isize
+                    // Smooth wheel/trackpad scrolling
+                    let cell_h = renderer.lock().unwrap().cell_height.max(1.0);
+                    let rows_delta: f32 = match delta {
+                        MouseScrollDelta::LineDelta(_x, y) => -y * 3.0, // tune: 2.5..4.0
+                        MouseScrollDelta::PixelDelta(p) => {
+                            (-(p.y as f32) / cell_h).clamp(-60.0, 60.0)
                         }
                     };
                     
-                    if lines != 0 {
-                        let mut g = grid.lock().unwrap();
-                        if lines > 0 {
-                            g.scroll_up(lines.abs() as usize);
-                        } else {
-                            g.scroll_down(lines.abs() as usize);
-                        }
-                        renderer.set_text(g.get_display_content());
-                        window.request_redraw();
+                    {
+                        let mut s = scroll.lock().unwrap();
+                        // Immediate response + inertia kick
+                        s.subrow += rows_delta;
+                        s.vel_rows_per_s += rows_delta * 12.0; // inertia gain
+                        
+                        // User actively scrolled → unstick from bottom
+                        s.stick_to_bottom = false;
                     }
+                    
+                    window.request_redraw();
                 }
                 
                 WindowEvent::MouseInput { state, button, .. } => {
                     if button == MouseButton::Left {
                         if state == ElementState::Pressed {
-                            // Begin selection
+                            // Calculate cell position
+                            let (cw, ch) = {
+                                let r = renderer.lock().unwrap();
+                                (r.cell_width, r.cell_height)
+                            };
                             let (col, row) = pixels_to_cell(
                                 cursor_position.0,
                                 cursor_position.1,
-                                renderer.cell_width,
-                                renderer.cell_height
+                                cw,
+                                ch
                             );
-                            selection.dragging = true;
-                            selection.region = Some(Region { 
-                                start: (col, row), 
-                                end: (col, row) 
-                            });
+                            
+                            // Check for Cmd+Click on URL
+                            if modifiers.super_key() {
+                                let g = grid.lock().unwrap();
+                                if let Some(url) = detect_url_at_position(&g, col, row) {
+                                    info!("Opening URL: {}", url);
+                                    // Open URL in default browser
+                                    #[cfg(target_os = "macos")]
+                                    {
+                                        let _ = std::process::Command::new("open")
+                                            .arg(&url)
+                                            .spawn();
+                                    }
+                                    return; // Don't process as normal click
+                                }
+                            }
+                            
+                            // Handle multi-click selection
+                            let now = Instant::now();
+                            const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(500);
+                            
+                            // Check if this is a double or triple click
+                            if let Some(last_time) = selection.last_click_time {
+                                if let Some((last_col, last_row)) = selection.last_click_pos {
+                                    if now.duration_since(last_time) < DOUBLE_CLICK_TIME 
+                                       && last_col == col && last_row == row {
+                                        selection.click_count += 1;
+                                    } else {
+                                        selection.click_count = 1;
+                                    }
+                                } else {
+                                    selection.click_count = 1;
+                                }
+                            } else {
+                                selection.click_count = 1;
+                            }
+                            
+                            selection.last_click_time = Some(now);
+                            selection.last_click_pos = Some((col, row));
+                            
+                            // Perform selection based on click count
+                            match selection.click_count {
+                                2 => {
+                                    // Double-click: select word
+                                    let g = grid.lock().unwrap();
+                                    let (start_col, end_col) = find_word_boundaries(&g, col, row);
+                                    selection.region = Some(Region {
+                                        start: (start_col, row),
+                                        end: (end_col, row)
+                                    });
+                                    selection.dragging = false; // Don't drag on double-click
+                                }
+                                3 => {
+                                    // Triple-click: select line
+                                    let g = grid.lock().unwrap();
+                                    let (start_col, end_col) = find_line_boundaries(&g, row);
+                                    selection.region = Some(Region {
+                                        start: (start_col, row),
+                                        end: (end_col, row)
+                                    });
+                                    selection.dragging = false; // Don't drag on triple-click
+                                    selection.click_count = 0; // Reset for next click
+                                }
+                                _ => {
+                                    // Single click: start normal selection
+                                    selection.dragging = true;
+                                    selection.region = Some(Region { 
+                                        start: (col, row), 
+                                        end: (col, row) 
+                                    });
+                                }
+                            }
+                            
                             selection_text = None; // Clear old selection text
                             window.request_redraw();
                         } else {
@@ -217,11 +431,15 @@ async fn run(args: Args) -> Result<()> {
                 }
                 
                 WindowEvent::Resized(physical_size) => {
-                    renderer.resize(physical_size);
-                    
-                    // Calculate cells based on actual font metrics
-                    let cols = ((physical_size.width as f32) / renderer.cell_width).floor().max(1.0) as u16;
-                    let rows = ((physical_size.height as f32) / renderer.cell_height).floor().max(1.0) as u16;
+                    let (cols, rows) = {
+                        let mut r = renderer.lock().unwrap();
+                        r.resize(physical_size);
+                        
+                        // Calculate cells based on actual font metrics
+                        let cols = ((physical_size.width as f32) / r.cell_width).floor().max(1.0) as u16;
+                        let rows = ((physical_size.height as f32) / r.cell_height).floor().max(1.0) as u16;
+                        (cols, rows)
+                    };
                     
                     // Update grid - preserve content
                     {
@@ -231,6 +449,24 @@ async fn run(args: Args) -> Result<()> {
                     
                     // Update PTY
                     let _ = pty.resize(rows, cols);
+                    
+                    // Reset fractional scroll to avoid stale offsets after metrics change
+                    {
+                        let g = grid.lock().unwrap();
+                        let total = g.scrollback.len() + g.rows;
+                        let vis = g.rows;
+                        let max_top = total.saturating_sub(vis);
+                        
+                        let mut s = scroll.lock().unwrap();
+                        if s.stick_to_bottom {
+                            s.top_abs = max_top;
+                        } else {
+                            s.top_abs = s.top_abs.min(max_top);
+                        }
+                        s.subrow = 0.0;
+                        s.vel_rows_per_s = 0.0;
+                    }
+                    
                     window.request_redraw();
                 }
                 
@@ -258,7 +494,14 @@ async fn run(args: Args) -> Result<()> {
                                     g.scrollback.clear();
                                     g.x = 0;
                                     g.y = 0;
-                                    renderer.set_text(g.get_display_content());
+                                }
+                                {
+                                    let g = grid.lock().unwrap();
+                                    let cells = g.get_cells_for_display();
+                                    let content = g.get_display_content();
+                                    let mut r = renderer.lock().unwrap();
+                                    r.set_cells(cells, g.cols, g.rows);
+                                    r.set_text(content);
                                 }
                                 window.request_redraw();
                                 // Ask shell to repaint prompt (Ctrl-L)
@@ -277,6 +520,21 @@ async fn run(args: Args) -> Result<()> {
                                     // If no selection and no shift, let Ctrl-C through for SIGINT
                                     let _ = pty.write(b"\x03");
                                 }
+                            }
+                            
+                            // Find: ⌘F
+                            PhysicalKey::Code(KeyCode::KeyF) => {
+                                search.active = !search.active;
+                                if search.active {
+                                    info!("Search mode activated");
+                                    // TODO: Show search UI overlay
+                                } else {
+                                    info!("Search mode deactivated");
+                                    search.query.clear();
+                                    search.matches.clear();
+                                    search.current_match = None;
+                                }
+                                window.request_redraw();
                             }
                             
                             // Paste: ⌘V
@@ -326,13 +584,18 @@ async fn run(args: Args) -> Result<()> {
                             // Zoom controls
                             // Cmd + (Note: '+' is Shift + '=' so we watch Equal)
                             PhysicalKey::Code(KeyCode::Equal) => {
-                                let new_size = renderer.font_size() + STEP_PT;
-                                renderer.set_font_size(new_size);
-                                
-                                // Recalculate cols/rows with new font size
-                                let size = window.inner_size();
-                                let cols = ((size.width as f32) / renderer.cell_width).floor().max(1.0) as u16;
-                                let rows = ((size.height as f32) / renderer.cell_height).floor().max(1.0) as u16;
+                                let (cols, rows) = {
+                                    let mut r = renderer.lock().unwrap();
+                                    let new_size = r.font_size() + STEP_PT;
+                                    r.set_font_size(new_size);
+                                    
+                                    // Recalculate cols/rows with new font size
+                                    let size = window.inner_size();
+                                    let cols = ((size.width as f32) / r.cell_width).floor().max(1.0) as u16;
+                                    let rows = ((size.height as f32) / r.cell_height).floor().max(1.0) as u16;
+                                    info!("Zoom in: font size {}", r.font_size());
+                                    (cols, rows)
+                                };
                                 
                                 // Update grid - preserve content
                                 {
@@ -342,18 +605,40 @@ async fn run(args: Args) -> Result<()> {
                                 
                                 // Update PTY
                                 let _ = pty.resize(rows, cols);
+                                
+                                // Reset fractional scroll to avoid stale offsets after zoom
+                                {
+                                    let g = grid.lock().unwrap();
+                                    let total = g.scrollback.len() + g.rows;
+                                    let vis = g.rows;
+                                    let max_top = total.saturating_sub(vis);
+                                    
+                                    let mut s = scroll.lock().unwrap();
+                                    if s.stick_to_bottom {
+                                        s.top_abs = max_top;
+                                    } else {
+                                        s.top_abs = s.top_abs.min(max_top);
+                                    }
+                                    s.subrow = 0.0;
+                                    s.vel_rows_per_s = 0.0;
+                                }
+                                
                                 window.request_redraw();
-                                info!("Zoom in: font size {}", renderer.font_size());
                             }
                             // Cmd -
                             PhysicalKey::Code(KeyCode::Minus) => {
-                                let new_size = renderer.font_size() - STEP_PT;
-                                renderer.set_font_size(new_size);
-                                
-                                // Recalculate cols/rows with new font size
-                                let size = window.inner_size();
-                                let cols = ((size.width as f32) / renderer.cell_width).floor().max(1.0) as u16;
-                                let rows = ((size.height as f32) / renderer.cell_height).floor().max(1.0) as u16;
+                                let (cols, rows) = {
+                                    let mut r = renderer.lock().unwrap();
+                                    let new_size = r.font_size() - STEP_PT;
+                                    r.set_font_size(new_size);
+                                    
+                                    // Recalculate cols/rows with new font size
+                                    let size = window.inner_size();
+                                    let cols = ((size.width as f32) / r.cell_width).floor().max(1.0) as u16;
+                                    let rows = ((size.height as f32) / r.cell_height).floor().max(1.0) as u16;
+                                    info!("Zoom out: font size {}", r.font_size());
+                                    (cols, rows)
+                                };
                                 
                                 // Update grid - preserve content
                                 {
@@ -363,17 +648,39 @@ async fn run(args: Args) -> Result<()> {
                                 
                                 // Update PTY
                                 let _ = pty.resize(rows, cols);
+                                
+                                // Reset fractional scroll to avoid stale offsets after zoom
+                                {
+                                    let g = grid.lock().unwrap();
+                                    let total = g.scrollback.len() + g.rows;
+                                    let vis = g.rows;
+                                    let max_top = total.saturating_sub(vis);
+                                    
+                                    let mut s = scroll.lock().unwrap();
+                                    if s.stick_to_bottom {
+                                        s.top_abs = max_top;
+                                    } else {
+                                        s.top_abs = s.top_abs.min(max_top);
+                                    }
+                                    s.subrow = 0.0;
+                                    s.vel_rows_per_s = 0.0;
+                                }
+                                
                                 window.request_redraw();
-                                info!("Zoom out: font size {}", renderer.font_size());
                             }
                             // Cmd 0 (reset)
                             PhysicalKey::Code(KeyCode::Digit0) => {
-                                renderer.set_font_size(DEFAULT_PT);
-                                
-                                // Recalculate cols/rows with new font size
-                                let size = window.inner_size();
-                                let cols = ((size.width as f32) / renderer.cell_width).floor().max(1.0) as u16;
-                                let rows = ((size.height as f32) / renderer.cell_height).floor().max(1.0) as u16;
+                                let (cols, rows) = {
+                                    let mut r = renderer.lock().unwrap();
+                                    r.set_font_size(DEFAULT_PT);
+                                    
+                                    // Recalculate cols/rows with new font size
+                                    let size = window.inner_size();
+                                    let cols = ((size.width as f32) / r.cell_width).floor().max(1.0) as u16;
+                                    let rows = ((size.height as f32) / r.cell_height).floor().max(1.0) as u16;
+                                    info!("Zoom reset: font size {}", DEFAULT_PT);
+                                    (cols, rows)
+                                };
                                 
                                 // Update grid - preserve content
                                 {
@@ -383,8 +690,25 @@ async fn run(args: Args) -> Result<()> {
                                 
                                 // Update PTY
                                 let _ = pty.resize(rows, cols);
+                                
+                                // Reset fractional scroll to avoid stale offsets after zoom reset
+                                {
+                                    let g = grid.lock().unwrap();
+                                    let total = g.scrollback.len() + g.rows;
+                                    let vis = g.rows;
+                                    let max_top = total.saturating_sub(vis);
+                                    
+                                    let mut s = scroll.lock().unwrap();
+                                    if s.stick_to_bottom {
+                                        s.top_abs = max_top;
+                                    } else {
+                                        s.top_abs = s.top_abs.min(max_top);
+                                    }
+                                    s.subrow = 0.0;
+                                    s.vel_rows_per_s = 0.0;
+                                }
+                                
                                 window.request_redraw();
-                                info!("Zoom reset: font size {}", DEFAULT_PT);
                             }
                             _ => {}
                         }
@@ -456,32 +780,55 @@ async fn run(args: Args) -> Result<()> {
                         
                         // Scrollback controls
                         PhysicalKey::Code(KeyCode::PageUp) => {
-                            let mut g = grid.lock().unwrap();
-                            g.page_up();
-                            renderer.set_text(g.get_display_content());
+                            {
+                                let mut s = scroll.lock().unwrap();
+                                let g = grid.lock().unwrap();
+                                let page_size = g.rows;
+                                s.top_abs = s.top_abs.saturating_sub(page_size);
+                                s.subrow = 0.0;
+                                s.stick_to_bottom = false;
+                            }
                             window.request_redraw();
                             None
                         }
                         PhysicalKey::Code(KeyCode::PageDown) => {
-                            let mut g = grid.lock().unwrap();
-                            g.page_down();
-                            renderer.set_text(g.get_display_content());
+                            {
+                                let mut s = scroll.lock().unwrap();
+                                let g = grid.lock().unwrap();
+                                let page_size = g.rows;
+                                let total_lines = g.scrollback.len() + g.rows;
+                                let max_top = total_lines.saturating_sub(g.rows);
+                                s.top_abs = (s.top_abs + page_size).min(max_top);
+                                s.subrow = 0.0;
+                                if s.top_abs == max_top {
+                                    s.stick_to_bottom = true;
+                                }
+                            }
                             window.request_redraw();
                             None
                         }
                         PhysicalKey::Code(KeyCode::Home) if modifiers.shift_key() => {
                             // Shift+Home: scroll to top
-                            let mut g = grid.lock().unwrap();
-                            g.scrollback.scroll_to_top();
-                            renderer.set_text(g.get_display_content());
+                            {
+                                let mut s = scroll.lock().unwrap();
+                                s.top_abs = 0;
+                                s.subrow = 0.0;
+                                s.stick_to_bottom = false;
+                            }
                             window.request_redraw();
                             None
                         }
                         PhysicalKey::Code(KeyCode::End) if modifiers.shift_key() => {
                             // Shift+End: scroll to bottom
-                            let mut g = grid.lock().unwrap();
-                            g.scroll_to_bottom();
-                            renderer.set_text(g.get_display_content());
+                            {
+                                let mut s = scroll.lock().unwrap();
+                                let g = grid.lock().unwrap();
+                                let total_lines = g.scrollback.len() + g.rows;
+                                let max_top = total_lines.saturating_sub(g.rows);
+                                s.top_abs = max_top;
+                                s.subrow = 0.0;
+                                s.stick_to_bottom = true;
+                            }
                             window.request_redraw();
                             None
                         }
@@ -508,18 +855,103 @@ async fn run(args: Args) -> Result<()> {
                 }
                 
                 WindowEvent::RedrawRequested => {
-                    // Update renderer with current selection for highlighting
-                    if let Some(region) = selection.region {
-                        renderer.selection = Some((region.start, region.end));
-                    } else {
-                        renderer.selection = None;
+                    // Smooth scrolling animation with proper edge clamping
+                    let now = Instant::now();
+                    let (should_animate, top_abs, y_offset_px) = {
+                        let mut s = scroll.lock().unwrap();
+                        let dt = (now - s.last_t).as_secs_f32().min(0.05);
+                        s.last_t = now;
+                        
+                        // Integrate inertia
+                        s.subrow += s.vel_rows_per_s * dt;
+                        // Friction (exponential-ish)
+                        let friction = 8.0_f32; // higher → stops quicker
+                        s.vel_rows_per_s *= (1.0 - friction * dt).clamp(0.0, 1.0);
+                        
+                        // Convert whole rows from subrow safely with bounds-aware loops
+                        let (total, vis) = {
+                            let g = grid.lock().unwrap();
+                            (g.scrollback.len() + g.rows, g.rows)
+                        };
+                        let max_top = total.saturating_sub(vis);
+                        
+                        // Move up (positive subrow) while allowed
+                        while s.subrow >= 1.0 && s.top_abs < max_top {
+                            s.subrow -= 1.0;
+                            s.top_abs += 1;
+                        }
+                        // Move down (negative subrow) while allowed
+                        while s.subrow <= -1.0 && s.top_abs > 0 {
+                            s.subrow += 1.0;
+                            s.top_abs -= 1;
+                        }
+                        
+                        // Clamp remaining fractional subrow so it never exceeds available range at edges
+                        let up_room = (max_top - s.top_abs) as f32;   // how many rows we can still go up
+                        let down_room = s.top_abs as f32;              // how many rows we can go down
+                        
+                        // Clamp carefully to avoid min > max panic
+                        if up_room > 0.0 && down_room > 0.0 {
+                            s.subrow = s.subrow.clamp(-(down_room.min(1.0)), up_room.min(1.0));
+                        } else if up_room > 0.0 {
+                            s.subrow = s.subrow.clamp(0.0, up_room.min(1.0));
+                        } else if down_room > 0.0 {
+                            s.subrow = s.subrow.clamp(-(down_room.min(1.0)), 0.0);
+                        } else {
+                            s.subrow = 0.0;
+                        }
+                        
+                        // Auto-stick when user hasn't scrolled up and inertia is tiny
+                        if (s.top_abs == max_top) && s.vel_rows_per_s.abs() < 0.02 && s.subrow.abs() < 0.02 {
+                            s.stick_to_bottom = true;
+                        }
+                        if s.stick_to_bottom {
+                            s.top_abs = max_top;
+                            s.subrow = 0.0;
+                            s.vel_rows_per_s = 0.0;
+                        }
+                        
+                        let cell_h = renderer.lock().unwrap().cell_height;
+                        let y_offset_px = -s.subrow * cell_h; // ONE transform for all draws
+                        
+                        // Keep animating while there is motion
+                        let should_animate = s.vel_rows_per_s.abs() > 0.02 || s.subrow.abs() > 0.02;
+                        
+                        (should_animate, s.top_abs, y_offset_px)
+                    };
+                    
+                    // Set viewport for renderer
+                    {
+                        let mut r = renderer.lock().unwrap();
+                        r.set_viewport(top_abs, y_offset_px);
+                        
+                        // Update text content based on viewport
+                        let (cells, content, cursor_x, cursor_y, cols, rows) = {
+                            let g = grid.lock().unwrap();
+                            (g.get_cells_for_display(), g.get_display_content(), g.x, g.y, g.cols, g.rows)
+                        };
+                        r.set_cells(cells, cols, rows);
+                        r.set_text(content);
+                        r.set_cursor(cursor_x, cursor_y, true);
+                        
+                        // Update renderer with current selection for highlighting
+                        if let Some(region) = selection.region {
+                            r.selection = Some((region.start, region.end));
+                        } else {
+                            r.selection = None;
+                        }
                     }
                     
-                    if let Err(e) = renderer.render_frame() {
+                    // Keep animating if we have velocity
+                    if should_animate {
+                        window.request_redraw();
+                    }
+                    
+                    if let Err(e) = renderer.lock().unwrap().render_frame() {
                         match e.downcast_ref::<wgpu::SurfaceError>() {
                             Some(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                                 let size = window.inner_size();
-                                renderer.resize(size);
+                                renderer.lock().unwrap().resize(size);
                             }
                             Some(wgpu::SurfaceError::OutOfMemory) => {
                                 error!("Out of memory");
